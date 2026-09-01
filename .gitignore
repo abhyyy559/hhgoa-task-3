@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Secrets — NEVER commit
+.env
+
+# Models / data artifacts
+models/
+data/phase0_photos/
+*.onnx
+
+# OS / tooling
+install.log
+install.err
+.DS_Store
