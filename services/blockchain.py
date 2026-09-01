@@ -57,7 +57,7 @@ AMOY_CHAIN_ID = 80002  # Polygon Amoy testnet
 DEFAULT_RPC_URL = "https://polygon-amoy.drpc.org"
 DEFAULT_RPC_FALLBACK = "https://polygon-amoy-bor-rpc.publicnode.com"
 
-PINATA_PIN_URL = "https://api.pinata.xyz/pinning/pinJSONToIPFS"
+PINATA_PIN_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
 PINATA_TIMEOUT_S = 30
 
 TX_WAIT_TIMEOUT_S = 180  # seconds to wait for a receipt before giving up
@@ -150,7 +150,7 @@ def verify_integrity(
 # IPFS pinning (Pinata) — best-effort, non-fatal (§4: content_cid nullable)
 # ---------------------------------------------------------------------------
 def ipfs_gateway_url(cid: str) -> str:
-    gateway = os.getenv("PINATA_GATEWAY", "gateway.pinata.cloud").rstrip("/")
+    gateway = (os.getenv("PINATA_GATEWAY") or "gateway.pinata.cloud").rstrip("/")
     return f"https://{gateway}/ipfs/{cid}"
 
 
