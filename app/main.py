@@ -419,3 +419,14 @@ def pipeline_events(job_id: str) -> list[PipelineEvent]:
         return list(job.events)
 
 
+# Minimal one-page terminal-style UI (Phase 4 — hard 1-2h cap). Mounted last so
+# every /api route above takes precedence. Not part of the CONTRACTS.md surface.
+from pathlib import Path  # noqa: E402
+
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+if _UI_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
+
+

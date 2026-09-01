@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Face ID & Blockchain Verification — Pipeline</title>
+<style>
+  :root { --bg:#0a0e0a; --fg:#9fef9f; --dim:#4a7a4a; --err:#ef7f7f; --ok:#7fefc7; }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.5 "Consolas","Cascadia Mono",monospace;
+         margin:0; padding:24px; }
+  h1 { font-size:16px; font-weight:normal; letter-spacing:2px; color:var(--ok);
+       border-bottom:1px solid var(--dim); padding-bottom:8px; }
+  .hint { color:var(--dim); font-size:12px; }
+  button { background:transparent; color:var(--fg); border:1px solid var(--fg);
+           font:inherit; padding:6px 18px; cursor:pointer; }
+  button:hover { background:var(--fg); color:var(--bg); }
+  button:disabled { opacity:.4; cursor:default; }
+  #log { margin-top:18px; border:1px solid var(--dim); padding:12px; min-height:220px;
+         white-space:pre-wrap; font-size:13px; }
+  .stage-ok { color:var(--ok); }
+  .stage-fail { color:var(--err); }
+  .evt { margin:2px 0; }
+  .ts { color:var(--dim); }
+  #result { margin-top:16px; border:1px solid var(--dim); padding:12px; display:none; }
+  #result a { color:var(--ok); }
+  .kv { margin:2px 0; }
+  .k { color:var(--dim); display:inline-block; width:150px; }
+</style>
+</head>
+<body>
+<h1>FACE-ID &gt;&gt; SEARCH &gt;&gt; VERIFY &gt;&gt; ANCHOR [polygon amoy]</h1>
+<p class="hint">
+  Upload a photo of a consenting team member. The pipeline runs live:
+  face detection (buffalo_l, CPU) &rarr; real web search (Google Vision Web
+  Detection) &rarr; independent verification &rarr; integrity anchor on-chain.
+  Every stage event is logged below &mdash; nothing is hidden.
+</p>
+<p>
+  <input type="file" id="img" accept="image/*">
+  <button id="go" onclick="startPipeline()">run pipeline</button>
+  <span id="jobid" class="hint"></span>
+</p>
+<div id="log" aria-live="polite">waiting for job&hellip;</div>
+<div id="result"></div>
+<p class="hint">
+  The chain proves content integrity (this fingerprint was anchored and hasn't
+  changed), NOT that a post belongs to a person. IPFS pinning is not permanence.
+</p>
+<script>
+let timer = null;
+const log = document.getElementById("log");
+
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+
+function addEvent(e) {
+  const cls = /FAILURE|FAILED|NO_|VERIFICATION_FAILED/.test(e.status) ? "stage-fail" : "stage-ok";
+  log.insertAdjacentHTML("beforeend",
+    `<div class="evt"><span class="ts">${esc(e.timestamp.slice(11, 23))}</span> `
+    + `[<span class="${cls}">${esc(e.stage)}</span>] ${esc(e.status)} `
+    + `<span class="ts">${esc(JSON.stringify(e.detail)).slice(0, 140)}</span></div>`);
+}
+
+async function poll(jobId) {
+  const st = await (await fetch(`/api/pipeline/${jobId}/status`)).json();
+  const evs = await (await fetch(`/api/pipeline/${jobId}/events`)).json();
+  if (evs.length !== log.childElementCount) {
+    log.innerHTML = "";
+    evs.forEach(addEvent);
+  }
+  const res = await fetch(`/api/pipeline/${jobId}/result`);
+  if (res.ok) {
+    const r = await res.json();
+    const terminal = ["BLOCKCHAIN_CONFIRMED","BLOCKCHAIN_FAILURE","VERIFICATION_FAILED",
+      "NO_SEARCH_RESULTS","SEARCH_API_FAILURE","NO_FACE_DETECTED","LOW_IMAGE_QUALITY",
+      "SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH"];
+    if (terminal.includes(r.status)) {
+      clearInterval(timer);
+      const v = r.verification;
+      const o = r.on_chain_record;
+      document.getElementById("result").innerHTML = `
+        <div class="kv"><span class="k">final status</span> <b>${esc(r.status)}</b></div>
+        ${v ? `<div class="kv"><span class="k">decision</span> ${esc(v.decision)} (zone ${esc(v.zone)}, similarity ${v.independent_similarity_score.toFixed(3)})</div>
+        <div class="kv"><span class="k">reason</span> ${esc(v.reason)}</div>` : ""}
+        ${o ? `<div class="kv"><span class="k">tx hash</span> ${esc(o.tx_hash)}</div>
+        <div class="kv"><span class="k">block</span> ${o.block_number}</div>` : ""}
+        ${r.polygonscan_url ? `<div class="kv"><span class="k">polygonscan</span> <a href="${esc(r.polygonscan_url)}" target="_blank">${esc(r.polygonscan_url)}</a></div>` : ""}
+        ${r.error_detail ? `<div class="kv"><span class="k">error detail</span> ${esc(r.error_detail)}</div>` : ""}`;
+      document.getElementById("go").disabled = false;
+    }
+  }
+}
+
+async function startPipeline() {
+  const file = document.getElementById("img").files[0];
+  if (!file) { alert("choose an image first"); return; }
+  log.textContent = "submitting…";
+  document.getElementById("result").innerHTML = "";
+  document.getElementById("go").disabled = true;
+  const fd = new FormData();
+  fd.append("image", file, file.name);
+  const resp = await fetch("/api/pipeline/start", { method: "POST", body: fd });
+  if (!resp.ok) {
+    log.textContent = "start failed: " + (await resp.text());
+    document.getElementById("go").disabled = false;
+    return;
+  }
+  const { job_id } = await resp.json();
+  document.getElementById("jobid").textContent = "job " + job_id;
+  timer = setInterval(() => poll(jobIdSafe = job_id), 600);
+}
+</script>
+</body>
+</html>
