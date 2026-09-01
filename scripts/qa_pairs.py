@@ -75,8 +75,7 @@ def main() -> int:
     rows: list[tuple[str, str, str, float, str]] = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
-            a_name = names[i]
-            b_name = names[j]
+            a_name, b_name = names[i], names[j]
             a_label, a_emb, _a_q = detections[a_name]
             b_label, b_emb, _b_q = detections[b_name]
             a, b = np.asarray(a_emb), np.asarray(b_emb)

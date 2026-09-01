@@ -19,7 +19,6 @@ e2e step is the real system with NO stubs — whatever terminal state it reaches
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -40,6 +39,7 @@ def banner(text: str) -> None:
 # ---------------------------------------------------------------------------
 def step_env() -> bool:
     import os
+    from eth_account import Account
 
     banner("STEP env — key presence + format checks")
     ok = True
@@ -59,8 +59,6 @@ def step_env() -> bool:
     pk = os.getenv("AMOY_PRIVATE_KEY", "").strip()
     if pk:
         try:
-            from eth_account import Account
-
             acct = Account.from_key(pk)
             print(f"  AMOY_PRIVATE_KEY format: VALID (address {acct.address})")
             declared = os.getenv("AMOY_WALLET_ADDRESS", "").strip()

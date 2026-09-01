@@ -94,6 +94,18 @@ be silently overwritten. RPC endpoints: drpc primary, publicnode fallback.
   reason rather than a faked score.
 - **No website.** One terminal-style UI page at most (hard 1–2 h cap).
 
+## Live validation status (Sept 1, 2026)
+
+| Check | Result |
+|---|---|
+| Pinata IPFS pin (H2) | **PASS** — live CID pinned via `api.pinata.cloud` (the correct host) |
+| Amoy RPC connectivity (H3) | **PASS** — both endpoints, chainId 80002, gas ~30–60 gwei |
+| Google Vision Web Detection (H1) | **BLOCKED-HUMAN** — key is valid but GCP billing is not enabled (`403 PERMISSION_DENIED`); enable billing on project `807377235294` then run `python scripts\go_live.py vision` |
+| Amoy wallet (H3) | **BLOCKED-HUMAN** — `AMOY_PRIVATE_KEY`/`AMOY_WALLET_ADDRESS` in `.env` currently hold an RPC URL, not a wallet; generate a throwaway funded Amoy wallet, paste its key + address, then run `python scripts\go_live.py amoy e2e` |
+| §9 pair matrix (real model) | 15/15 agreement — same-person cosine **0.9186** (HIGH), different-person max **0.0700** (LOW, 5× margin below the 0.35 review threshold); thresholds supported by this evidence but pair counts still below §9 minimums until team photos are added |
+
+Any step: `.venv\Scripts\python.exe scripts\go_live.py <env|amoy|pinata|vision|e2e|all>` — the `all` target runs the entire live pipeline (real face → real search → real verification → Pinata CID → Amoy anchor) and prints the Polygonscan link.
+
 ## Repo layout
 
 ```

@@ -10,7 +10,7 @@
 | **Deadline** | September 7, 2026, 11:59 PM |
 | **Days remaining** | 6 |
 | **Last updated** | September 1, 2026 (evening — full code build complete) |
-| **OVERALL COMPLETION** | **~85%** (all code + scripts + UI + demo assets done; only live-key runs, real-photo pair matrix, recording, submission remain) |
+| **OVERALL COMPLETION** | **~90%** (all code + scripts + UI + demo assets done; live Pinata + Amoy + §9 matrix validated; only H1-billing, real wallet, team-photo matrix growth, recording, submission remain) |
 
 **Legend:** `[DONE]` complete · `[WIP]` in progress · `[PENDING]` not started · `[BLOCKED-HUMAN]` waiting on human action · `[N/A]` dropped by design
 
@@ -48,9 +48,9 @@
 | `contracts/schemas.py` (executable CONTRACTS.md) | `[DONE]` | 100% | All 10 status enums; `extra="forbid"` on Search payload so a leaked embedding/score is a runtime crash |
 | `.env` + `.env.example` (gitignored) | `[BLOCKED-HUMAN]` | 0% | Needs keys from `HUMAN_ACTIONS.md` items H1–H3 |
 | InsightFace smoke test (CPU, 512-d embedding) | `[DONE]` | 100% | buffalo_l auto-downloads ~275 MB on first run |
-| **Phase 0 validation script** (`scripts/validate_search.py`) | `[DONE]` | 90% | Script built + ready; live run `[BLOCKED-HUMAN]` — needs H1 key + H4 photos (blocks provider choice) |
-| Amoy smoke test (`scripts/smoke_amoy.py`) | `[DONE]` | 100% | **PASS live**: both RPCs connected, chainId 80002, block ~46.4M; wallet/balance check ready, needs H3 |
-| Pinata smoke test (`scripts/smoke_pinata.py`) | `[DONE]` | 80% | Script built + runs; live pin `[BLOCKED-HUMAN]` — needs H2 JWT |
+| **Phase 0 validation script** (`scripts/validate_search.py`) | `[DONE]` | 92% | Script built + ready; live run `[BLOCKED-HUMAN]` — needs H1 **billing enabled** (key valid, 403 PERMISSION_DENIED) + H4 photos |
+| Amoy smoke test (`scripts/smoke_amoy.py`) | `[DONE]` | 100% | **PASS live**: both RPCs connected, chainId 80002, gas ~30–60 gwei; wallet/balance check ready, needs H3 (real wallet key — current .env holds an RPC URL, not a key) |
+| Pinata smoke test (`scripts/smoke_pinata.py`) | `[DONE]` | 100% | **LIVE PASS** — CID pinned via api.pinata.cloud (corrected host); gateway URL verified |
 
 ### Phase 1 — Five Parallel Coding Agents (target: Sep 2–3)
 | Task | Status | % | Owner | Notes |
@@ -73,10 +73,10 @@
 ### Phase 3 — QA Matrix (target: Sep 4)
 | Task | Status | % | Notes |
 |---|---|---|---|
-| Same-person pairs (5–10) | `[PENDING]` | 20% | 1 pair measured with real model (astronaut full vs crop: cosine 0.9914, HIGH zone); needs H4 team photos for the full matrix (`scripts/qa_matrix.py`) |
-| Different-person pairs (10+) | `[BLOCKED-HUMAN]` | 0% | Needs H4 real photos of different people |
+| Same-person pairs (5–10) | `[PENDING]` | 30% | 15 pairs measured w/ real model from local images: same-person 0.9186 HIGH, different-person max 0.0700 (15/15 agreement); needs H4 team photos for the full matrix (`scripts/qa_pairs_from_local.py`) |
+| Different-person pairs (10+) | `[DONE]` | 100% | 14 different-person pairs from local images, all LOW (max 0.0700) |
 | Bad-quality (5), no-face (3), multi-face (3) cases | `[DONE]` | 100% | Ran via `scripts/qa_matrix.py` with the real model: no-face 3/3 correct, multi-face 3/3 correct, bad-quality 6 cases (blur/noise/dark/64px OK w/ embeddings 0.60–0.83; 24px/pixelated honestly NO_FACE) |
-| Threshold finalized from evidence + honest results table | `[PENDING]` | 40% | Partial matrix recorded; finalization awaits H4 pair matrix |
+| Threshold finalized from evidence + honest results table | `[PENDING]` | 60% | 15/15 agreement supports 0.48/0.35; finalization awaits H4 team-photo pairs |
 
 ### Phase 4 — Demo Assets (target: Sep 5)
 | Task | Status | % | Notes |
@@ -158,6 +158,7 @@
 
 | Date | Entry |
 |---|---|
+| 2026-09-01 | Live validation: Pinata pin PASS (api.pinata.cloud host corrected), Amoy RPCs PASS; Vision key valid but GCP billing BLOCKED-HUMAN; wallet fields need real key. Added go_live.py, qa_pairs, qa_pairs_from_local, survey_photos; §9 matrix: 15/15 agreement (same 0.9186 HIGH, diff max 0.0700). |
 | 2026-09-01 | Pending-task sweep: Phase 0 smoke/validate scripts (Amoy smoke PASSED live); Phase 3 partial QA matrix run with real model (no-face 3/3, multi-face 3/3, same-person pair cosine 0.9914); Phase 4 tamper demo + one-page UI built and verified; full HTTP pipeline run exercised (real detection → honest SEARCH_API_FAILURE without H1 key). |
 | 2026-09-01 | Full code build: schemas + 4 services + FastAPI backend + AnchorRecord.sol + 74 tests (all passing; solc compile verified). Two CONTRACTS.md amendments logged. Remaining: live-key validation (H1-H3), Phase 3 QA matrix, tamper demo script, UI, recording. |
 | 2026-09-01 | Project initialized. Architecture v2 reviewed, contracts confirmed consistent, 4 research agents verified all external dependencies (3 corrections applied — see §4). Status + human-actions files created. |

@@ -52,7 +52,7 @@ def main() -> int:
         return 1
 
     cid = resp.json().get("IpfsHash")
-    gateway = os.getenv("PINATA_GATEWAY", "gateway.pinata.cloud").rstrip("/")
+    gateway = (os.getenv("PINATA_GATEWAY") or "gateway.pinata.cloud").rstrip("/")
     print(f"  pinned CID: {cid}")
     print(f"  gateway URL: https://{gateway}/ipfs/{cid}")
     print("\nRESULT: PASS")
