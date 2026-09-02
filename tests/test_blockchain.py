@@ -315,6 +315,70 @@ def test_anchor_wraps_unexpected_errors_as_write_error(fake_chain, monkeypatch):
         bc.anchor_record(blockchain_record())
 
 
+def test_anchor_retries_transient_submit_failures(fake_chain, monkeypatch):
+    """Transient send failures are retried (fresh nonce) before giving up."""
+    monkeypatch.setenv("AMOY_CONTRACT_ADDRESS", "0x" + "cd" * 20)
+    monkeypatch.setattr(bc, "RETRY_DELAYS_S", (0.0, 0.0))  # keep the test fast
+    w3 = _FakeW3()
+    call_n = {"n": 0}
+    original_send = w3.eth.send_raw_transaction
+
+    def flaky_send(raw):
+        call_n["n"] += 1
+        if call_n["n"] <= 2:  # first two sends "fail" transiently
+            raise ConnectionError("rpc timeout")
+        return original_send(raw)
+
+    w3.eth.send_raw_transaction = flaky_send
+    fake_chain.setattr(bc, "_get_rpc_w3", lambda: w3)
+    out = bc.anchor_record(blockchain_record())
+    assert call_n["n"] == 3  # two failures, then success
+    assert out.confirmed is True
+
+
+def test_anchor_fails_after_max_retries(fake_chain, monkeypatch):
+    """Persistent failure surfaces a typed error after MAX_TX_ATTEMPTS."""
+    monkeypatch.setenv("AMOY_CONTRACT_ADDRESS", "0x" + "cd" * 20)
+    monkeypatch.setattr(bc, "RETRY_DELAYS_S", (0.0, 0.0))
+    w3 = _FakeW3()
+    w3.eth.send_raw_transaction = lambda raw: (_ for _ in ()).throw(
+        ConnectionError("rpc down")
+    )
+    fake_chain.setattr(bc, "_get_rpc_w3", lambda: w3)
+    with pytest.raises(bc.BlockchainWriteError, match="MAX_TX_ATTEMPTS|rpc down"):
+        bc.anchor_record(blockchain_record())
+
+
+
+# ---------------------------------------------------------------------------
+# deploy_anchor_contract + _get_account
+# ---------------------------------------------------------------------------
+def test_deploy_anchor_contract_returns_address(fake_chain, monkeypatch):
+    w3 = _FakeW3()
+    fake_chain.setattr(bc, "_get_rpc_w3", lambda: w3)
+    address = bc.deploy_anchor_contract()
+    assert address.startswith("0x")
+    assert len(address) == 42
+
+
+def test_deploy_anchor_contract_reverts_raise_write_error(fake_chain, monkeypatch):
+    w3 = _FakeW3(receipt_status=0)
+    fake_chain.setattr(bc, "_get_rpc_w3", lambda: w3)
+    with pytest.raises(bc.BlockchainWriteError, match="reverted"):
+        bc.deploy_anchor_contract()
+
+
+def test_get_account_missing_key(monkeypatch):
+    monkeypatch.delenv("AMOY_PRIVATE_KEY", raising=False)
+    with pytest.raises(bc.BlockchainConfigError, match="AMOY_PRIVATE_KEY is not set"):
+        bc._get_account()
+
+
+def test_get_account_invalid_key(monkeypatch):
+    monkeypatch.setenv("AMOY_PRIVATE_KEY", "not-a-hex-key")
+    with pytest.raises(bc.BlockchainConfigError, match="could not be used"):
+        bc._get_account()
+
 # ---------------------------------------------------------------------------
 # Solidity toolchain — real compile, skipped if solc can't be fetched
 # ---------------------------------------------------------------------------

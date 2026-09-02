@@ -51,18 +51,42 @@ Three deliberate design points a reviewer should check first:
 # 3. Start the API
 .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
 
-# 4. Start a pipeline job and watch it finish
+# 4. Start a pipeline job and watch it finish (live SSE narration in the UI)
 curl -F "image=@photo.jpg" http://127.0.0.1:8000/api/pipeline/start
 #    → {"job_id": "..."}
 curl http://127.0.0.1:8000/api/pipeline/<job_id>/status
 curl http://127.0.0.1:8000/api/pipeline/<job_id>/result   # + /events for the full lineage
+curl http://127.0.0.1:8000/api/pipeline/<job_id>/events/stream   # SSE live feed (UI uses this)
 
-# 5. Tests (74: vision, search, verification, blockchain, backend)
+# 5. Deploy the on-chain contract once (optional — auto-deploys on first anchor)
+.venv\Scripts\python.exe scripts\deploy_contract.py
+#    → writes AMOY_CONTRACT_ADDRESS to .env + prints the Polygonscan link
+
+# 6. Tests (90+: vision, search, verification, blockchain, backend incl. SSE/retry/delete)
 .venv\Scripts\python.exe -m pytest -q
 ```
 
 The first vision call needs the `buffalo_l` model pack (~275 MB) —
 `scripts/bootstrap_model.py` pre-downloads it.
+
+## API surface
+
+```
+POST /api/pipeline/start              → { job_id }          (multipart image upload)
+GET  /api/pipeline/{job_id}/status    → { stage, status }
+GET  /api/pipeline/{job_id}/result    → final structured result + event log
+GET  /api/pipeline/{job_id}/events    → full §5 event log (JSON)
+GET  /api/pipeline/{job_id}/events/stream → SSE live narration feed (UI)
+DELETE /api/pipeline/{job_id}         → free a finished job (registry hygiene)
+GET  /api/health                      → liveness + readiness checks
+GET  /                               → terminal-style live UI
+```
+
+Blockchain anchoring retries transient RPC failures with exponential backoff
+and a **fresh nonce** on every attempt, then surfaces a typed
+`BLOCKCHAIN_FAILURE` — it never claims `BLOCKCHAIN_CONFIRMED` without a real
+receipt. The in-memory job registry is bounded (200 jobs, 2h TTL) so a long
+demo never grows memory unboundedly.
 
 ## Which chain, and why
 
@@ -109,12 +133,18 @@ Any step: `.venv\Scripts\python.exe scripts\go_live.py <env|amoy|pinata|vision|e
 ## Repo layout
 
 ```
-contracts/schemas.py     executable CONTRACTS.md — pydantic models, extra="forbid"
-services/vision.py       face detect + encode (InsightFace buffalo_l, CPU)
-services/search.py       reverse-image retrieval (Google Vision / SerpAPI fallback)
-services/verification.py independent re-fetch + re-encode + re-score
-services/blockchain.py   canonical record, Pinata pin, Amoy anchoring, re-verification
-app/main.py              FastAPI job manager + §5 data-lineage event log
-solidity/AnchorRecord.sol  minimal anchoring contract (solc 0.8.24)
-tests/                   74 tests: contract conformance + every unhappy path
+contracts/schemas.py      executable CONTRACTS.md — pydantic models, extra="forbid"
+services/vision.py        face detect + encode (InsightFace buffalo_l, CPU)
+services/search.py        reverse-image retrieval (Google Vision / SerpAPI fallback)
+services/verification.py  independent re-fetch + re-encode + re-score
+services/blockchain.py    canonical record, Pinata pin, Amoy anchoring, re-verification
+app/main.py               FastAPI job manager + §5 data-lineage event log (SSE)
+solidity/AnchorRecord.sol minimal anchoring contract (solc 0.8.24)
+scripts/deploy_contract.py deploy AnchorRecord once + persist address to .env
+scripts/go_live.py        run every remaining live validation step
+scripts/tamper_demo.py    pixel/field-tamper → hash mismatch demo
+scripts/qa_pairs*.py      §9 same/different-person pair matrix (real model)
+docs/consent.md           participant consent record (HUMAN_ACTIONS H5)
+tests/                    90+ tests: conformance + every unhappy path + SSE/retry/delete
+ui/index.html             terminal-style live UI (SSE narration)
 ```

@@ -84,6 +84,18 @@ HTTP_TIMEOUT_S: float = 20.0
 #: Maximum number of candidate images tried for a usable face.
 MAX_IMAGE_ATTEMPTS: int = 3
 
+#: Honest, descriptive User-Agent for outbound fetches. CDNs and social sites
+#: frequently 403 the default ``python-requests`` UA; sending a real identifier
+#: is both more reliable and more honest than impersonating a browser.
+USER_AGENT = (
+    "hhgoa-task3/1.0 (student identity-verification pipeline; "
+    "public code, contact via project GitHub repo)"
+)
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/json,image/*,*/*;q=0.8",
+}
+
 # ---------------------------------------------------------------------------
 # Helpers (monkeypatch seams for tests; each is independently testable)
 # ---------------------------------------------------------------------------
@@ -98,7 +110,7 @@ def _fetch_page(url: str) -> Tuple[int, str]:
     separate raising helper so ``verify()`` can convert it into a decision.
     """
     try:
-        resp = requests.get(url, timeout=HTTP_TIMEOUT_S)
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=HTTP_TIMEOUT_S)
     except requests.RequestException as exc:  # network / DNS / timeout
         raise PageFetchError(f"{type(exc).__name__}: {exc}") from exc
     if resp.status_code != 200:
@@ -158,7 +170,7 @@ def _extract_image_urls(
 def _download_image(url: str) -> Optional[np.ndarray]:
     """Download and decode an image URL into a BGR ndarray, or ``None``."""
     try:
-        resp = requests.get(url, timeout=HTTP_TIMEOUT_S)
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=HTTP_TIMEOUT_S)
         if resp.status_code != 200:
             return None
         buf = np.frombuffer(resp.content, dtype=np.uint8)

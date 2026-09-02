@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,12 @@ PINATA_TIMEOUT_S = 30
 TX_WAIT_TIMEOUT_S = 180  # seconds to wait for a receipt before giving up
 DEPLOY_GAS = 1_800_000
 ANCHOR_GAS = 400_000
+
+#: Transient tx-submit retries (fresh nonce each attempt) before surfacing
+#: BLOCKCHAIN_FAILURE — the free Amoy RPCs are occasionally flaky (Risk
+#: Register: "Free RPC endpoint flaky mid-demo"), so we retry with backoff.
+MAX_TX_ATTEMPTS = 3
+RETRY_DELAYS_S: Tuple[float, ...] = (1.0, 2.0)
 
 SOLC_VERSION = "0.8.24"
 SOL_SOURCE_PATH = (
@@ -277,24 +284,21 @@ def _load_artifacts() -> Tuple[list[dict[str, Any]], str]:
 def anchor_record(record: CanonicalRecord) -> OnChainRecord:
     """Anchor the canonical record on Polygon Amoy and wait for the receipt.
 
+    Transient submit failures (flaky free RPCs) are retried with exponential
+    backoff and a **fresh nonce** on every attempt — never reused, so a dropped
+    response can't collide. Once a receipt exists we never retry: a reverted
+    transaction is a deterministic failure surfaced as ``BLOCKCHAIN_FAILURE``.
+
     Returns the §4 ``OnChainRecord`` with ``confirmed=True`` only after a real
-    receipt with status 1. Any failure raises a typed error that the backend
-    surfaces as ``BLOCKCHAIN_FAILURE`` — never a silent success, and never a
+    receipt with status 1 — never a silent success, never a
     ``BLOCKCHAIN_CONFIRMED`` claim without a receipt.
     """
-    private_key = os.getenv("AMOY_PRIVATE_KEY")
-    if not private_key:
-        raise BlockchainConfigError(
-            "AMOY_PRIVATE_KEY is not set — a funded Amoy wallet is required "
-            "to anchor (HUMAN_ACTIONS.md H3)"
-        )
     if not record.content_hash:
         raise BlockchainConfigError("record has no content_hash to anchor")
 
     try:
-        abi, bytecode = _load_artifacts()
-        w3 = _get_rpc_w3()
-        account = w3.eth.account.from_key(private_key)
+        abi, _bytecode = _load_artifacts()
+        w3, account = _get_account()
         chain_id = int(os.getenv("AMOY_CHAIN_ID", str(AMOY_CHAIN_ID)))
         contract_address = os.getenv("AMOY_CONTRACT_ADDRESS")
 
@@ -303,31 +307,54 @@ def anchor_record(record: CanonicalRecord) -> OnChainRecord:
                 address=w3.to_checksum_address(contract_address), abi=abi
             )
         else:
-            # One-time deploy: the contract is tiny; deploying per-environment
-            # keeps the demo self-contained without a manual migration step.
-            contract = _deploy(w3, account, abi, bytecode, chain_id)
+            # Zero-config fallback: deploy once (see deploy_anchor_contract).
+            contract = w3.eth.contract(address=deploy_anchor_contract(), abi=abi)
 
-        nonce = w3.eth.get_transaction_count(account.address)
-        tx = contract.functions.anchorRecord(
-            _to_bytes32(record.record_id),
-            _to_bytes32(record.content_hash),
-            record.content_cid or "",
-            _to_bytes32(record.source_reference_hash),
-            record.verification_result,
-        ).build_transaction(
-            {
-                "from": account.address,
-                "nonce": nonce,
-                "gas": ANCHOR_GAS,
-                "gasPrice": w3.eth.gas_price,
-                "chainId": chain_id,
-            }
-        )
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(
-            tx_hash, timeout=TX_WAIT_TIMEOUT_S
-        )
+        receipt = None
+        last_error: Optional[BaseException] = None
+        for attempt in range(MAX_TX_ATTEMPTS):
+            try:
+                # Fresh nonce EVERY attempt: if a send reached the chain but
+                # the response was lost, reusing the nonce would fail.
+                nonce = w3.eth.get_transaction_count(account.address)
+                tx = contract.functions.anchorRecord(
+                    _to_bytes32(record.record_id),
+                    _to_bytes32(record.content_hash),
+                    record.content_cid or "",
+                    _to_bytes32(record.source_reference_hash),
+                    record.verification_result,
+                ).build_transaction(
+                    {
+                        "from": account.address,
+                        "nonce": nonce,
+                        "gas": ANCHOR_GAS,
+                        "gasPrice": w3.eth.gas_price,
+                        "chainId": chain_id,
+                    }
+                )
+                signed = account.sign_transaction(tx)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    tx_hash, timeout=TX_WAIT_TIMEOUT_S
+                )
+                break  # we have a receipt — never retry past this point
+            except BlockchainWriteError:
+                raise  # chainId mismatch etc. is not transient; don't retry
+            except Exception as exc:  # noqa: BLE001 — transient network/RPC error
+                last_error = exc
+                print(
+                    f"[BlockchainService] anchor tx attempt "
+                    f"{attempt + 1}/{MAX_TX_ATTEMPTS} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if attempt < MAX_TX_ATTEMPTS - 1:
+                    time.sleep(RETRY_DELAYS_S[attempt])
+
+        if receipt is None:
+            raise BlockchainWriteError(
+                f"transaction submission failed after {MAX_TX_ATTEMPTS} attempts: "
+                f"{type(last_error).__name__}: {last_error}"
+            ) from last_error
         if receipt.status != 1:
             raise BlockchainWriteError("anchorRecord transaction reverted")
     except (BlockchainConfigError, BlockchainWriteError):
@@ -348,30 +375,73 @@ def anchor_record(record: CanonicalRecord) -> OnChainRecord:
     )
 
 
-def _deploy(w3: Any, account: Any, abi: list, bytecode: str, chain_id: int) -> Any:
-    """Deploy AnchorRecord and return the live contract object."""
-    nonce = w3.eth.get_transaction_count(account.address)
-    deploy_tx = (
-        w3.eth.contract(abi=abi, bytecode=bytecode)
-        .constructor()
-        .build_transaction(
-            {
-                "from": account.address,
-                "nonce": nonce,
-                "gas": DEPLOY_GAS,
-                "gasPrice": w3.eth.gas_price,
-                "chainId": chain_id,
-            }
+def _get_account() -> Tuple[Any, Any]:
+    """Return ``(w3, account)`` for the configured funded Amoy wallet.
+
+    Typed failure when the wallet key is missing or malformed — never a
+    silent fake success.
+    """
+    private_key = os.getenv("AMOY_PRIVATE_KEY")
+    if not private_key:
+        raise BlockchainConfigError(
+            "AMOY_PRIVATE_KEY is not set — a funded Amoy wallet is required "
+            "to anchor (HUMAN_ACTIONS.md H3)"
         )
-    )
-    signed = account.sign_transaction(deploy_tx)
-    deploy_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(
-        deploy_hash, timeout=TX_WAIT_TIMEOUT_S
-    )
-    if receipt.status != 1:
-        raise BlockchainWriteError("AnchorRecord deployment reverted")
-    return w3.eth.contract(address=receipt.contractAddress, abi=abi)
+    try:
+        w3 = _get_rpc_w3()
+        account = w3.eth.account.from_key(private_key)
+    except BlockchainWriteError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — malformed key / broken account
+        raise BlockchainConfigError(
+            f"AMOY_PRIVATE_KEY could not be used to derive an account: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not account.address:
+        raise BlockchainConfigError("AMOY_PRIVATE_KEY produced an empty address")
+    return w3, account
+
+
+def deploy_anchor_contract() -> str:
+    """Deploy ``AnchorRecord`` once and return its checksummed address.
+
+    Prefer doing this once via ``scripts/deploy_contract.py`` (which also
+    writes ``AMOY_CONTRACT_ADDRESS`` into ``.env``). Deploying again would
+    create a duplicate contract — ``anchor_record`` auto-deploys as a
+    zero-config fallback only.
+    """
+    abi, bytecode = _load_artifacts()
+    w3, account = _get_account()
+    chain_id = int(os.getenv("AMOY_CHAIN_ID", str(AMOY_CHAIN_ID)))
+    try:
+        nonce = w3.eth.get_transaction_count(account.address)
+        deploy_tx = (
+            w3.eth.contract(abi=abi, bytecode=bytecode)
+            .constructor()
+            .build_transaction(
+                {
+                    "from": account.address,
+                    "nonce": nonce,
+                    "gas": DEPLOY_GAS,
+                    "gasPrice": w3.eth.gas_price,
+                    "chainId": chain_id,
+                }
+            )
+        )
+        signed = account.sign_transaction(deploy_tx)
+        deploy_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(
+            deploy_hash, timeout=TX_WAIT_TIMEOUT_S
+        )
+        if receipt.status != 1:
+            raise BlockchainWriteError("AnchorRecord deployment reverted")
+    except (BlockchainConfigError, BlockchainWriteError):
+        raise
+    except Exception as exc:  # noqa: BLE001 — every other failure is a write failure
+        raise BlockchainWriteError(f"{type(exc).__name__}: {exc}") from exc
+    address = w3.to_checksum_address(receipt.contractAddress)
+    print(f"[BlockchainService] deployed AnchorRecord at {address}")
+    return address
 
 
 def read_onchain_record(record_id: str) -> OnChainRecord:

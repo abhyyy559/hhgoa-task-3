@@ -17,6 +17,7 @@ import app.main as main
 from contracts.schemas import (
     CanonicalStatus,
     OnChainRecord,
+    PipelineEvent,
     SearchCandidate,
     SearchOutput,
     SourceType,
@@ -328,4 +329,83 @@ def test_empty_upload_400(client):
 def test_missing_upload_422(client):
     resp = client.post("/api/pipeline/start")
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# New endpoints: SSE stream, DELETE, job-store bounds, richer health
+# ---------------------------------------------------------------------------
+import asyncio
+
+
+def test_health_includes_checks(client):
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok"
+    assert "pipeline_version" in body
+    assert isinstance(body["checks"], dict)
+    for key in (
+        "vision_model_pack",
+        "google_vision_key_set",
+        "pinata_jwt_set",
+        "amoy_wallet_set",
+        "amoy_contract_deployed",
+    ):
+        assert key in body["checks"]
+
+
+def test_sse_stream_replays_and_terminates():
+    """The pure SSE generator must replay existing events and end with 'done'."""
+    job = main.JobState("stream-job")
+    job.events.append(
+        PipelineEvent(
+            job_id="stream-job",
+            stage=main.EventStage.FACE_DETECTED,
+            timestamp="2026-09-01T00:00:00+00:00",
+            status="OK",
+            detail={"face_id": "abc"},
+        )
+    )
+    job.done = True
+
+    async def collect():
+        chunks = []
+        async for chunk in main._event_stream_iter(job):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect())
+    blob = "".join(chunks)
+    assert 'event: pipeline' in blob
+    assert '"face_id":"abc"' in blob
+    assert 'event: done' in blob
+
+
+def test_delete_finished_job(client, monkeypatch):
+    patch_pipeline(monkeypatch, verify=rejecting_verify)
+    job_id = start_job(client)
+    wait_done(job_id)
+    assert client.delete(f"/api/pipeline/{job_id}").status_code == 200
+    # Deleted job is gone from the registry.
+    assert client.get(f"/api/pipeline/{job_id}/status").status_code == 404
+
+
+def test_delete_running_job_is_409(client):
+    # Insert a job that is explicitly NOT done.
+    main._JOBS["still-running"] = main.JobState("still-running")
+    assert client.delete("/api/pipeline/still-running").status_code == 409
+
+
+def test_delete_unknown_job_is_404(client):
+    assert client.delete("/api/pipeline/nope").status_code == 404
+
+
+def test_job_store_is_bounded(monkeypatch):
+    monkeypatch.setattr(main, "MAX_JOBS", 3)
+    main._JOBS.clear()
+    for i in range(6):
+        j = main.JobState(f"j{i}")
+        j.created_at = float(i)  # deterministic ordering
+        main._JOBS[f"j{i}"] = j
+    main._trim_job_store()
+    assert len(main._JOBS) <= 3
+
 

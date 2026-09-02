@@ -28,14 +28,18 @@ records submit + confirm in the event log).
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from contracts.schemas import (
     CanonicalRecord,
@@ -90,6 +94,7 @@ class JobState:
         self.polygonscan_url: Optional[str] = None
         self.error_detail: Optional[str] = None
         self.done = False
+        self.created_at = time.time()
         self._lock = threading.Lock()
 
     def emit(
@@ -123,6 +128,30 @@ class JobState:
 
 _JOBS: dict[str, JobState] = {}
 _JOBS_LOCK = threading.Lock()
+
+#: Job-store hygiene: keep the in-memory registry bounded and reap finished /
+#: expired jobs so a long demo (many trials) never grows memory unboundedly.
+MAX_JOBS = 200
+JOB_TTL_SECONDS = 60 * 60 * 2  # 2 hours; done jobs are evicted first anyway
+
+
+def _trim_job_store() -> None:
+    """Bounded job registry: evict done, then expired, then-oldest jobs."""
+    now = time.time()
+    with _JOBS_LOCK:
+        if len(_JOBS) <= MAX_JOBS:
+            return
+        for jid, job in list(_JOBS.items()):
+            if job.done:
+                _JOBS.pop(jid, None)
+        if len(_JOBS) > MAX_JOBS:
+            for jid, job in list(_JOBS.items()):
+                if now - job.created_at > JOB_TTL_SECONDS:
+                    _JOBS.pop(jid, None)
+        if len(_JOBS) > MAX_JOBS:
+            oldest = sorted(_JOBS.values(), key=lambda j: j.created_at)
+            for job in oldest[: len(_JOBS) - MAX_JOBS]:
+                _JOBS.pop(job.job_id, None)
 
 
 def _set_error(job: JobState, message: str) -> None:
@@ -354,8 +383,21 @@ def _pipeline_body(job: JobState, image_bytes: bytes, image_bgr: np.ndarray) -> 
 # HTTP endpoints (CONTRACTS.md §6)
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "pipeline_version": blockchain_service.PIPELINE_VERSION}
+def health() -> dict[str, Any]:
+    """Liveness + readiness. No network calls — the chain is not touched here,
+    so a flaky RPC can never take /api/health down during a demo."""
+    model_pack = vision_service._model_pack_path()
+    return {
+        "status": "ok",
+        "pipeline_version": blockchain_service.PIPELINE_VERSION,
+        "checks": {
+            "vision_model_pack": model_pack.is_dir() and any(model_pack.iterdir()),
+            "google_vision_key_set": bool(os.getenv("GOOGLE_VISION_API_KEY")),
+            "pinata_jwt_set": bool(os.getenv("PINATA_JWT")),
+            "amoy_wallet_set": bool(os.getenv("AMOY_PRIVATE_KEY")),
+            "amoy_contract_deployed": bool(os.getenv("AMOY_CONTRACT_ADDRESS")),
+        },
+    }
 
 
 @app.post("/api/pipeline/start", response_model=PipelineStartResponse)
@@ -368,6 +410,7 @@ async def start_pipeline(image: UploadFile = File(...)) -> PipelineStartResponse
         raise HTTPException(status_code=400, detail="upload is not a decodable image")
 
     job_id = str(uuid.uuid4())
+    _trim_job_store()
     with _JOBS_LOCK:
         _JOBS[job_id] = JobState(job_id)
     threading.Thread(
@@ -417,6 +460,59 @@ def pipeline_events(job_id: str) -> list[PipelineEvent]:
     job = _get_job(job_id)
     with job._lock:
         return list(job.events)
+
+
+async def _event_stream_iter(job: JobState) -> AsyncGenerator[str, None]:
+    """SSE payload generator: replay the log, then live-stream new events.
+
+    Kept separate from the HTTP layer so it is unit-testable without a live
+    server or TestClient streaming (CONTRACTS.md §5 — the UI consumes this as
+    its live narration feed; polling /events is the fallback).
+    """
+    idx = 0
+    while True:
+        with job._lock:
+            new_events = list(job.events[idx:])
+            done = job.done
+        for event in new_events:
+            yield f"event: pipeline\ndata: {event.model_dump_json()}\n\n"
+            idx += 1
+        if done:
+            yield "event: done\ndata: {}\n\n"
+            return
+        await asyncio.sleep(0.5)
+
+
+@app.get("/api/pipeline/{job_id}/events/stream")
+async def pipeline_events_stream(job_id: str) -> StreamingResponse:
+    """Server-Sent Events live feed of the §5 event log.
+
+    Replays existing events immediately, then streams each new event as the
+    background pipeline emits it, terminating with a ``done`` event. The UI
+    consumes this directly (EventSource) with a polling fallback.
+    """
+    job = _get_job(job_id)
+    return StreamingResponse(
+        _event_stream_iter(job),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.delete("/api/pipeline/{job_id}")
+def delete_job(job_id: str) -> dict[str, str]:
+    """Free a finished job from the in-memory registry (demo hygiene)."""
+    job = _get_job(job_id)
+    with job._lock:
+        if not job.done:
+            raise HTTPException(status_code=409, detail="job still running")
+    with _JOBS_LOCK:
+        _JOBS.pop(job_id, None)
+    return {"deleted": job_id}
 
 
 # Minimal one-page terminal-style UI (Phase 4 — hard 1-2h cap). Mounted last so

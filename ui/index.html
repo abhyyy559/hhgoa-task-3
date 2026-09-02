@@ -39,6 +39,7 @@
   <input type="file" id="img" accept="image/*">
   <button id="go" onclick="startPipeline()">run pipeline</button>
   <span id="jobid" class="hint"></span>
+  <span id="status" class="hint" style="margin-left:10px;"></span>
 </p>
 <div id="log" aria-live="polite">waiting for job&hellip;</div>
 <div id="result"></div>
@@ -47,66 +48,99 @@
   changed), NOT that a post belongs to a person. IPFS pinning is not permanence.
 </p>
 <script>
-let timer = null;
+const TERMINAL = ["BLOCKCHAIN_CONFIRMED","BLOCKCHAIN_FAILURE","VERIFICATION_FAILED",
+  "NO_SEARCH_RESULTS","SEARCH_API_FAILURE","NO_FACE_DETECTED","LOW_IMAGE_QUALITY",
+  "SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH"];
 const log = document.getElementById("log");
+const resultBox = document.getElementById("result");
+const statusEl = document.getElementById("status");
+const goBtn = document.getElementById("go");
 
-function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+let pollTimer = null;
+let eventSource = null;
+let activeJob = null;
 
-function addEvent(e) {
+function esc(s){ const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function stopWatchers(){
+  if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  if (eventSource){ eventSource.close(); eventSource = null; }
+}
+function addEvent(e){
   const cls = /FAILURE|FAILED|NO_|VERIFICATION_FAILED/.test(e.status) ? "stage-fail" : "stage-ok";
   log.insertAdjacentHTML("beforeend",
-    `<div class="evt"><span class="ts">${esc(e.timestamp.slice(11, 23))}</span> `
-    + `[<span class="${cls}">${esc(e.stage)}</span>] ${esc(e.status)} `
-    + `<span class="ts">${esc(JSON.stringify(e.detail)).slice(0, 140)}</span></div>`);
+    `<div class="evt"><span class="ts">${esc(e.timestamp.slice(11, 23))}</span> ` +
+    `[<span class="${cls}">${esc(e.stage)}</span>] ${esc(e.status)} ` +
+    `<span class="ts">${esc(JSON.stringify(e.detail)).slice(0, 160)}</span></div>`);
 }
+function clearLog(){ log.innerHTML = ""; }
 
-async function poll(jobId) {
-  const st = await (await fetch(`/api/pipeline/${jobId}/status`)).json();
-  const evs = await (await fetch(`/api/pipeline/${jobId}/events`)).json();
-  if (evs.length !== log.childElementCount) {
-    log.innerHTML = "";
-    evs.forEach(addEvent);
-  }
+async function fetchResult(jobId){
   const res = await fetch(`/api/pipeline/${jobId}/result`);
-  if (res.ok) {
-    const r = await res.json();
-    const terminal = ["BLOCKCHAIN_CONFIRMED","BLOCKCHAIN_FAILURE","VERIFICATION_FAILED",
-      "NO_SEARCH_RESULTS","SEARCH_API_FAILURE","NO_FACE_DETECTED","LOW_IMAGE_QUALITY",
-      "SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH"];
-    if (terminal.includes(r.status)) {
-      clearInterval(timer);
-      const v = r.verification;
-      const o = r.on_chain_record;
-      document.getElementById("result").innerHTML = `
-        <div class="kv"><span class="k">final status</span> <b>${esc(r.status)}</b></div>
-        ${v ? `<div class="kv"><span class="k">decision</span> ${esc(v.decision)} (zone ${esc(v.zone)}, similarity ${v.independent_similarity_score.toFixed(3)})</div>
-        <div class="kv"><span class="k">reason</span> ${esc(v.reason)}</div>` : ""}
-        ${o ? `<div class="kv"><span class="k">tx hash</span> ${esc(o.tx_hash)}</div>
-        <div class="kv"><span class="k">block</span> ${o.block_number}</div>` : ""}
-        ${r.polygonscan_url ? `<div class="kv"><span class="k">polygonscan</span> <a href="${esc(r.polygonscan_url)}" target="_blank">${esc(r.polygonscan_url)}</a></div>` : ""}
-        ${r.error_detail ? `<div class="kv"><span class="k">error detail</span> ${esc(r.error_detail)}</div>` : ""}`;
-      document.getElementById("go").disabled = false;
-    }
+  if (!res.ok) return null;
+  const r = await res.json();
+  if (TERMINAL.includes(r.status)){
+    stopWatchers();
+    const v = r.verification, o = r.on_chain_record;
+    resultBox.style.display = "block";
+    resultBox.innerHTML =
+      `<div class="kv"><span class="k">final status</span> <b>${esc(r.status)}</b></div>` +
+      (v ? `<div class="kv"><span class="k">decision</span> ${esc(v.decision)} (zone ${esc(v.zone)}, similarity ${v.independent_similarity_score.toFixed(3)})</div>` +
+         `<div class="kv"><span class="k">reason</span> ${esc(v.reason)}</div>` : "") +
+      (o ? `<div class="kv"><span class="k">tx hash</span> ${esc(o.tx_hash)}</div>` +
+         `<div class="kv"><span class="k">block</span> ${o.block_number}</div>` : "") +
+      (r.polygonscan_url ? `<div class="kv"><span class="k">polygonscan</span> <a href="${esc(r.polygonscan_url)}" target="_blank" rel="noopener">${esc(r.polygonscan_url)}</a></div>` : "") +
+      (r.error_detail ? `<div class="kv"><span class="k">error detail</span> ${esc(r.error_detail)}</div>` : "");
+    statusEl.textContent = "job finished: " + r.status;
+    goBtn.disabled = false;
+    return r;
   }
+  return null;
 }
 
-async function startPipeline() {
+function startPolling(jobId){
+  pollTimer = setInterval(async () => {
+    const st = await (await fetch(`/api/pipeline/${jobId}/status`)).json();
+    statusEl.textContent = st.stage + " — " + (st.status ?? "starting");
+    await fetchResult(jobId);
+  }, 700);
+}
+
+function startStream(jobId){
+  if (typeof EventSource === "undefined"){ startPolling(jobId); return; }
+  eventSource = new EventSource(`/api/pipeline/${jobId}/events/stream`);
+  eventSource.addEventListener("pipeline", (ev) => { addEvent(JSON.parse(ev.data)); });
+  eventSource.addEventListener("done", async () => {
+    if (eventSource){ eventSource.close(); eventSource = null; }
+    await fetchResult(jobId);
+  });
+  eventSource.onerror = () => {
+    if (eventSource){ eventSource.close(); eventSource = null; }
+    startPolling(jobId); // SSE failed (proxy/gateway): fall back to polling
+  };
+}
+
+async function startPipeline(){
   const file = document.getElementById("img").files[0];
-  if (!file) { alert("choose an image first"); return; }
-  log.textContent = "submitting…";
-  document.getElementById("result").innerHTML = "";
-  document.getElementById("go").disabled = true;
+  if (!file){ alert("choose an image first"); return; }
+  stopWatchers();
+  clearLog();
+  resultBox.style.display = "none";
+  resultBox.innerHTML = "";
+  goBtn.disabled = true;
+  statusEl.textContent = "submitting...";
   const fd = new FormData();
   fd.append("image", file, file.name);
   const resp = await fetch("/api/pipeline/start", { method: "POST", body: fd });
-  if (!resp.ok) {
-    log.textContent = "start failed: " + (await resp.text());
-    document.getElementById("go").disabled = false;
+  if (!resp.ok){
+    statusEl.textContent = "start failed: " + (await resp.text());
+    goBtn.disabled = false;
     return;
   }
   const { job_id } = await resp.json();
-  document.getElementById("jobid").textContent = "job " + job_id;
-  timer = setInterval(() => poll(jobIdSafe = job_id), 600);
+  activeJob = job_id;
+  document.getElementById("jobid").textContent = "job " + job_id.slice(0, 8);
+  log.innerHTML = "waiting for events...";
+  startStream(job_id);
 }
 </script>
 </body>

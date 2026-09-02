@@ -61,6 +61,14 @@ MAX_RETRIES = 3  # retries after the initial attempt (total attempts = 4)
 RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)  # exponential backoff
 RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# Honest, descriptive User-Agent (see services/verification.py for rationale).
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "hhgoa-task3/1.0 (student identity-verification pipeline; "
+        "public code, contact via project GitHub repo)"
+    ),
+}
+
 SOCIAL_DOMAINS = (
     "facebook.com",
     "instagram.com",
@@ -163,6 +171,7 @@ def _vision_web_detection(
             resp = requests.post(
                 f"{VISION_ENDPOINT}?key={api_key}",
                 json=body,
+                headers=DEFAULT_HEADERS,
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
@@ -310,6 +319,7 @@ def _serpapi_fallback(
                 "image_url": image_url,
                 "api_key": serpapi_key,
             },
+            headers=DEFAULT_HEADERS,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
