@@ -46,7 +46,7 @@ Three deliberate design points a reviewer should check first:
 #    GOOGLE_VISION_API_KEY   (H1)  live web search
 #    PINATA_JWT              (H2)  IPFS pinning
 #    AMOY_PRIVATE_KEY        (H3)  funded Amoy testnet wallet (throwaway!)
-#    SERPAPI_KEY             (optional fallback)
+#    SERPAPI_KEY             (primary web search — SerpAPI Lens + Yandex, free tier 250/mo, no card)
 
 # 3. Start the API
 .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
@@ -62,7 +62,7 @@ curl http://127.0.0.1:8000/api/pipeline/<job_id>/events/stream   # SSE live feed
 .venv\Scripts\python.exe scripts\deploy_contract.py
 #    → writes AMOY_CONTRACT_ADDRESS to .env + prints the Polygonscan link
 
-# 6. Tests (90+: vision, search, verification, blockchain, backend incl. SSE/retry/delete)
+# 6. Tests (114: vision, search, verification, blockchain, backend incl. SSE/retry/delete) + `scripts/eval_matrix.py` threshold evidence
 .venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -100,33 +100,44 @@ be silently overwritten. RPC endpoints: drpc primary, publicnode fallback.
 
 ## Known limitations (stated honestly)
 
-- **Search coverage is whatever Google's index has.** Some faces simply have
-  no web presence — that's `NO_SEARCH_RESULTS`, a real terminal state, not an
-  error. Coverage per team member must be validated (Phase 0) before demo day.
-- **The 0.48 / 0.35 thresholds are empirical starting points** from published
-  buffalo_l cosine-similarity ranges, NOT proven-optimal for this dataset.
-  They are being re-derived from the §9 test matrix (same-person /
-  different-person / bad-quality batches) before freeze.
+- **Search coverage is whatever the provider indexes have.** SerpAPI Lens
+  (primary) + Yandex leg + Vision (if billing enabled). Some faces simply
+  have no web presence — that's `NO_SEARCH_RESULTS`, a real terminal state,
+  not an error. Coverage per demo subject must be validated before demo day
+  (have them post a clear public photo days ahead).
+- **Thresholds 0.48 / 0.35 are measured, with a stated limit.**
+  `scripts/eval_matrix.py` (real model, Sept 7): same-person **2/2 matched
+  (0.9186 both)**, different-person **25/25 cleanly rejected**, max impostor
+  score **0.07** — 5× margin below the 0.35 review threshold. Honest limit:
+  only 2 genuine same-person pairs so far; add team/friend pairs (target
+  5–10) before claiming generality. We selected these numbers from this
+  evidence, not from literature alone.
 - **Verification is an independent execution path, not statistical
   independence.** Separate fetch, separate detection, separate encoding,
   separate scoring — but the same underlying model. We call it that
   precisely rather than overclaiming.
 - **IPFS pinning is not permanence.** Pinata's free tier retains what we pin;
   that is not a guarantee. Documented, not hidden.
-- **Web Detection URLs can decay.** Candidate pages fetched minutes after the
-  search may 404; verification then returns `no_match` with an explanatory
-  reason rather than a faked score.
+- **Unreachable images are UNVERIFIED, never scored rejections.** Candidate
+  pages that 404, login-wall, or yield no detectable face return `no_match`
+  with `faces_checked == 0` and an `UNVERIFIED — …` reason (plus a
+  `candidate_retry` event) — "could not compare" is never presented as
+  "compared and rejected." Only scored faces (faces_checked ≥ 1) count as
+  genuine rejections.
 - **No website.** One terminal-style UI page at most (hard 1–2 h cap).
 
-## Live validation status (Sept 1, 2026)
+## Live validation status (Sept 7, 2026)
 
 | Check | Result |
 |---|---|
-| Pinata IPFS pin (H2) | **PASS** — live CID pinned via `api.pinata.cloud` (the correct host) |
-| Amoy RPC connectivity (H3) | **PASS** — both endpoints, chainId 80002, gas ~30–60 gwei |
-| Google Vision Web Detection (H1) | **BLOCKED-HUMAN** — key is valid but GCP billing is not enabled (`403 PERMISSION_DENIED`); enable billing on project `807377235294` then run `python scripts\go_live.py vision` |
-| Amoy wallet (H3) | **BLOCKED-HUMAN** — `AMOY_PRIVATE_KEY`/`AMOY_WALLET_ADDRESS` in `.env` currently hold an RPC URL, not a wallet; generate a throwaway funded Amoy wallet, paste its key + address, then run `python scripts\go_live.py amoy e2e` |
-| §9 pair matrix (real model) | 15/15 agreement — same-person cosine **0.9186** (HIGH), different-person max **0.0700** (LOW, 5× margin below the 0.35 review threshold); thresholds supported by this evidence but pair counts still below §9 minimums until team photos are added |
+| SerpAPI Lens open-web search | **PASS** — 59 candidates / 19 social on a stranger photo; top match verified 0.9116 |
+| Pinata IPFS pin (H2) | **PASS** — live CIDs pinned (`QmZVmtJ8…`, `QmXiLDTv…`) |
+| Amoy RPC connectivity (H3) | **PASS** — both endpoints, chainId 80002 |
+| Amoy wallet funds (H3) | **BLOCKED-HUMAN** — ~0.0079 MATIC vs ~0.0128 needed; top up at the Amoy faucet, verify with `scripts\go_live.py amoy`, then re-upload for the recording run |
+| Google Vision Web Detection (H1) | **BLOCKED** — key present but API answers HTTP 403 (billing/API not enabled); deprioritized, Lens covers the need |
+| Enrolled-gallery match | **PASS** — different-photo same-person 0.9186 → record → pin → anchor attempted (funds only blocker) |
+| Honest rejection | **PASS** — stranger vs gallery 0.05 / −0.04 → `PIPELINE_NO_CONFIDENT_MATCH`, no fake match |
+| §9 pair matrix (real model) | `scripts/eval_matrix.py`: same-person 2/2, different-person 25/25, max impostor 0.07 — supports 0.48/0.35; add pairs to reach 5–10 same-person minimum |
 
 Any step: `.venv\Scripts\python.exe scripts\go_live.py <env|amoy|pinata|vision|e2e|all>` — the `all` target runs the entire live pipeline (real face → real search → real verification → Pinata CID → Amoy anchor) and prints the Polygonscan link.
 
@@ -135,7 +146,7 @@ Any step: `.venv\Scripts\python.exe scripts\go_live.py <env|amoy|pinata|vision|e
 ```
 contracts/schemas.py      executable CONTRACTS.md — pydantic models, extra="forbid"
 services/vision.py        face detect + encode (InsightFace buffalo_l, CPU)
-services/search.py        reverse-image retrieval (Google Vision / SerpAPI fallback)
+services/search.py        reverse-image retrieval (SerpAPI Lens primary + Yandex leg, Vision optional; resolver tiers full→partial→page→similar)
 services/verification.py  independent re-fetch + re-encode + re-score
 services/blockchain.py    canonical record, Pinata pin, Amoy anchoring, re-verification
 app/main.py               FastAPI job manager + §5 data-lineage event log (SSE)

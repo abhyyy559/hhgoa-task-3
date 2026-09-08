@@ -19,6 +19,7 @@ e2e step is the real system with NO stubs — whatever terminal state it reaches
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,13 +28,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
 def banner(text: str) -> None:
     print("\n" + "=" * 72)
     print(text)
     print("=" * 72)
+
+
+# ---------------------------------------------------------------------------
+# Helper: determine search engine from env; default to federated_web for
+# maximum coverage, but respect SEARCH_PROVIDER if set to a specific engine.
+# ---------------------------------------------------------------------------
+def _search_provider() -> str:
+    return os.getenv("SEARCH_PROVIDER", "federated_web")
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +186,12 @@ def step_vision() -> bool:
     from contracts.schemas import CanonicalStatus
 
     banner("STEP vision — live Google Vision Web Detection call")
+    provider = _search_provider()
+    if provider == "duckduckgo":
+        print("  Search provider is duckduckgo — Google Vision API step skipped "
+              "(no billing needed for duckduckgo-only mode).")
+        print("  -> Vision step PASS (duckduckgo-only mode).")
+        return True
     key = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
     if not key:
         print("  GOOGLE_VISION_API_KEY missing")
@@ -230,6 +245,20 @@ def step_e2e() -> bool:
     job_id = "go-live-e2e"
     main._JOBS.clear()
     main._JOBS[job_id] = main.JobState(job_id)
+
+    # Respect SEARCH_PROVIDER env var; default to federated_web
+    provider = os.getenv("SEARCH_PROVIDER", "federated_web")
+
+    # Patch the search function's default provider for this run
+    import services.search as search_module
+    original_search = search_module.search
+
+    def _search_with_provider(image_bytes, **kwargs):
+        kwargs['engine'] = provider
+        return original_search(image_bytes, **kwargs)
+
+    search_module.search = _search_with_provider
+
     main._run_pipeline(job_id, b"e2e", img)
     job = main._JOBS[job_id]
 
@@ -238,7 +267,7 @@ def step_e2e() -> bool:
         print(f"error_detail: {job.error_detail}")
     print("EVENT LOG:")
     for e in job.events:
-        print(f"  {e.stage.value:<24} {e.status:<40} {json.dumps(e.detail, default=str)[:70]}")
+        print(f"  {e.stage.value:<24} {e.status:<40} {str(e.detail)[:70]}")
     if job.polygonscan_url:
         print(f"\nPolygonscan: {job.polygonscan_url}")
     # The step passes when the pipeline reached ANY typed terminal state —

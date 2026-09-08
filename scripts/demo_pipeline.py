@@ -71,15 +71,18 @@ def main_part_b() -> None:
     print("PART B — full happy path with STUBBED search/chain (keys pending H1/H3)")
     print("=" * 72)
 
-    # STUB: live search needs GOOGLE_VISION_API_KEY (H1) — stub retrieval.
+    # STUB: live search needs SERPAPI_KEY (H7) / VISION key (H1) — stub retrieval.
     def stub_search(image_bytes, *, image_url=None):
         return SearchOutput(
             candidates=[SearchCandidate(
                 candidate_id="stub-1",
-                candidate_url="https://example.com/team-member-post",
-                source_type=SourceType.WEB,
+                candidate_url="https://www.instagram.com/p/demo123/",
+                source_type=SourceType.SOCIAL,
+                thumbnail_url=None,
+                is_social_domain=True,
+                found_via="serpapi_lens",
             )],
-            status=CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH,
+            status=CanonicalStatus.SEARCH_RESULTS_FOUND,
         )
 
     # STUB: live anchoring needs AMOY_PRIVATE_KEY (H3) — return a fake receipt.

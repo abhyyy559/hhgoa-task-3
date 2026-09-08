@@ -75,12 +75,14 @@ def ok_search(image_bytes, *, image_url=None):
         candidates=[
             SearchCandidate(
                 candidate_id="c-1",
-                candidate_url="https://example.com/post",
-                source_type=SourceType.WEB,
+                candidate_url="https://www.instagram.com/p/test123/",
+                source_type=SourceType.SOCIAL,
                 thumbnail_url="https://img.example.com/t.jpg",
+                is_social_domain=True,
+                found_via="serpapi_lens",
             )
         ],
-        status=CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH,
+        status=CanonicalStatus.SEARCH_RESULTS_FOUND,
     )
 
 
@@ -140,13 +142,23 @@ def patch_pipeline(
     verify=matching_verify,
     pin=lambda record: "bafyfakeCID",
     anchor=None,
+    gallery_candidates=None,
 ):
+    import services.gallery as gallery_service
+
     monkeypatch.setattr(vision_service, "detect_and_encode", detect)
     monkeypatch.setattr(main.search_service, "search", search)
     monkeypatch.setattr(main.verification_service, "verify", verify)
     monkeypatch.setattr(main.blockchain_service, "pin_to_ipfs", pin)
     if anchor is not None:
         monkeypatch.setattr(main.blockchain_service, "anchor_record", anchor)
+    # Isolate from real enrolled gallery by default; opt-in via gallery_candidates.
+    if gallery_candidates is None:
+        monkeypatch.setattr(gallery_service, "search_gallery_candidates", lambda *a, **k: [])
+    else:
+        monkeypatch.setattr(
+            gallery_service, "search_gallery_candidates", lambda *a, **k: gallery_candidates
+        )
 
 
 def start_job(client) -> str:
@@ -262,9 +274,10 @@ def test_uncertain_never_becomes_a_match(client, monkeypatch):
     job_id = start_job(client)
     wait_done(job_id)
     job = main._JOBS[job_id]
-    # Honest uncertainty zone: candidates returned, no high-confidence match.
-    assert job.status == CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH
+    # Honest uncertainty zone: v3 PIPELINE_NO_CONFIDENT_MATCH, with retry events.
+    assert job.status == CanonicalStatus.PIPELINE_NO_CONFIDENT_MATCH
     assert all(e.stage != main.EventStage.RECORD_BUILT for e in job.events)
+    assert any(e.stage == main.EventStage.CANDIDATE_RETRY for e in job.events)
 
 
 def test_verification_reject_is_terminal_no_chain_write(client, monkeypatch):
@@ -272,9 +285,168 @@ def test_verification_reject_is_terminal_no_chain_write(client, monkeypatch):
     job_id = start_job(client)
     wait_done(job_id)
     job = main._JOBS[job_id]
-    assert job.status == CanonicalStatus.VERIFICATION_FAILED
+    assert job.status == CanonicalStatus.PIPELINE_NO_CONFIDENT_MATCH
     assert [e.stage.value for e in job.events][-1] == "verification_result"
     assert all(e.stage != main.EventStage.RECORD_BUILT for e in job.events)
+
+
+def test_nonsocial_web_match_does_not_anchor(client, monkeypatch):
+    """v3 §2: verified open-web non-social match alone is not sufficient."""
+
+    def web_only_search(image_bytes, *, image_url=None):
+        return SearchOutput(
+            candidates=[
+                SearchCandidate(
+                    candidate_id="web-1",
+                    candidate_url="https://example.com/blog-post",
+                    source_type=SourceType.WEB,
+                    thumbnail_url=None,
+                    is_social_domain=False,
+                    found_via="google_vision",
+                )
+            ],
+            status=CanonicalStatus.SEARCH_RESULTS_FOUND,
+        )
+
+    patch_pipeline(monkeypatch, search=web_only_search, verify=matching_verify)
+    job_id = start_job(client)
+    job = wait_done(job_id)
+    assert job.status == CanonicalStatus.PIPELINE_NO_CONFIDENT_MATCH
+    assert all(e.stage != main.EventStage.RECORD_BUILT for e in job.events)
+
+
+def test_all_top_candidates_evaluated_for_full_presence(client, monkeypatch):
+    """First match anchors, but every top candidate is still verified so the
+    lineup shows the full digital presence, not just the first hit."""
+
+    def two_social_search(image_bytes, *, image_url=None):
+        return SearchOutput(
+            candidates=[
+                SearchCandidate(
+                    candidate_id="s-1",
+                    candidate_url="https://www.instagram.com/p/first/",
+                    source_type=SourceType.SOCIAL,
+                    thumbnail_url="https://img.example.com/first.jpg",
+                    is_social_domain=True,
+                    found_via="serpapi_lens",
+                    match_type="full_match",
+                ),
+                SearchCandidate(
+                    candidate_id="s-2",
+                    candidate_url="https://x.com/user/status/2",
+                    source_type=SourceType.SOCIAL,
+                    thumbnail_url="https://img.example.com/second.jpg",
+                    is_social_domain=True,
+                    found_via="serpapi_lens",
+                    match_type="partial_match",
+                ),
+            ],
+            status=CanonicalStatus.SEARCH_RESULTS_FOUND,
+        )
+
+    def both_match(inp):
+        return VerificationOutput(
+            candidate_id=inp.candidate_id,
+            independent_similarity_score=0.90,
+            zone="HIGH",
+            decision=VerificationDecision.CANDIDATE_MATCH,
+            reason="test match",
+        )
+
+    patch_pipeline(
+        monkeypatch,
+        search=two_social_search,
+        verify=both_match,
+        anchor=lambda r: fake_anchor(r, "0xpresence"),
+    )
+    job_id = start_job(client)
+    job = wait_done(job_id)
+    assert job.status == CanonicalStatus.BLOCKCHAIN_CONFIRMED
+    # Deterministic: FIRST match anchors …
+    assert job.verification.candidate_id == "s-1"
+    # … while BOTH appear as matches in the lineup.
+    matched = [e for e in job.candidate_lineup if e["decision"] == "candidate_match"]
+    assert [e["candidate_id"] for e in matched] == ["s-1", "s-2"]
+
+
+def test_latency_derived_from_event_log_not_estimated():
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _ev(stage, seconds):
+        return PipelineEvent(
+            job_id="lat",
+            stage=stage,
+            timestamp=(base + timedelta(seconds=seconds)).isoformat(),
+            status="x",
+            detail={},
+        )
+
+    events = [
+        _ev(main.EventStage.FACE_DETECTED, 0.0),
+        _ev(main.EventStage.QUERY_SENT, 1.0),
+        _ev(main.EventStage.CANDIDATES_RETURNED, 4.0),
+        _ev(main.EventStage.VERIFICATION_RUN, 5.0),
+        _ev(main.EventStage.RECORD_BUILT, 9.0),
+        _ev(main.EventStage.BLOCKCHAIN_TX_SUBMITTED, 10.0),
+        _ev(main.EventStage.REVERIFICATION_RUN, 20.0),
+    ]
+    lat = main.derive_latency_ms(events)
+    assert lat["face_ms"] == 1000.0
+    assert lat["search_ms"] == 3000.0
+    assert lat["verify_ms"] == 4000.0
+    assert lat["record_ms"] == 1000.0
+    assert lat["chain_ms"] == 10000.0
+    assert lat["total_ms"] == 20000.0
+    # Skipped stages are absent, never zero-filled.
+    assert main.derive_latency_ms(events[:2]) == {"face_ms": 1000.0, "total_ms": 1000.0}
+    assert main.derive_latency_ms([]) == {}
+
+
+def test_happy_path_result_carries_latency(client, monkeypatch):
+    patch_pipeline(monkeypatch, anchor=lambda r: fake_anchor(r, "0xlat"))
+    job_id = start_job(client)
+    job = wait_done(job_id)
+    assert job.status == CanonicalStatus.BLOCKCHAIN_CONFIRMED
+    resp = client.get(f"/api/pipeline/{job_id}/result")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["latency_ms"]["total_ms"] >= 0
+    assert body["latency_ms"]["face_ms"] >= 0
+
+
+def test_gallery_match_anchors_with_labeled_source(client, monkeypatch):
+    """Enrolled-gallery matches anchor (labeled), bypassing the social gate."""
+
+    def gallery_search(image_bytes, *, image_url=None):
+        return SearchOutput(
+            candidates=[
+                SearchCandidate(
+                    candidate_id="gal-1",
+                    candidate_url="http://127.0.0.1:8000/api/gallery/profiles/abc",
+                    source_type=SourceType.WEB,
+                    thumbnail_url="http://127.0.0.1:8000/api/gallery/images/abc.jpg",
+                    is_social_domain=False,
+                    found_via=None,
+                )
+            ],
+            status=CanonicalStatus.SEARCH_RESULTS_FOUND,
+        )
+
+    patch_pipeline(
+        monkeypatch,
+        search=gallery_search,
+        verify=matching_verify,
+        anchor=lambda r: fake_anchor(r, "0xgal123"),
+    )
+    job_id = start_job(client)
+    job = wait_done(job_id)
+    assert job.status == CanonicalStatus.BLOCKCHAIN_CONFIRMED
+    assert job.source_url == "http://127.0.0.1:8000/api/gallery/profiles/abc"
+    assert job.lookup_source_url(job.canonical_record.record_id) == job.source_url
+    built = [e for e in job.events if e.stage == main.EventStage.RECORD_BUILT][0]
+    assert built.detail["match_source"] == "enrolled_gallery"
 
 
 def test_blockchain_config_failure_is_visible(client, monkeypatch):
@@ -407,5 +579,101 @@ def test_job_store_is_bounded(monkeypatch):
         main._JOBS[f"j{i}"] = j
     main._trim_job_store()
     assert len(main._JOBS) <= 3
+
+
+def test_gallery_enroll_and_retrieve_endpoints(client, tmp_path, monkeypatch):
+    import services.gallery as gallery
+    monkeypatch.setattr(gallery, "GALLERY_DIR", tmp_path / "gallery")
+    monkeypatch.setattr(gallery, "GALLERY_INDEX_FILE", tmp_path / "gallery" / "gallery_index.json")
+    gallery._ensure_gallery_dirs()
+
+    # Enroll via API
+    resp = client.post(
+        "/api/gallery/enroll",
+        data={
+            "full_name": "Dr. Sarah Chen",
+            "role": "Director of Cyber Defense",
+            "organization": "HH Goa Advanced AI",
+            "bio": "Lead architect on zero-trust biometric pipeline.",
+        },
+        files={"image": ("photo.png", PNG_BYTES, "image/png")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["member"]["full_name"] == "Dr. Sarah Chen"
+    member_id = data["member"]["member_id"]
+
+    # List gallery members
+    list_resp = client.get("/api/gallery/members")
+    assert list_resp.status_code == 200
+    members = list_resp.json()["members"]
+    assert len(members) == 1
+    assert members[0]["member_id"] == member_id
+
+    # Retrieve profile HTML
+    prof_resp = client.get(f"/api/gallery/profiles/{member_id}")
+    assert prof_resp.status_code == 200
+    assert "text/html" in prof_resp.headers["content-type"]
+    assert "Dr. Sarah Chen" in prof_resp.text
+
+    # Retrieve member image
+    img_resp = client.get(f"/api/gallery/images/{data['member']['image_filename']}")
+    assert img_resp.status_code == 200
+    assert img_resp.content == PNG_BYTES
+
+
+def test_multi_candidate_pipeline_evaluation(client, monkeypatch):
+    """Ensure pipeline evaluates candidate #1 when candidate #0 is rejected/fails."""
+    # Search returns 2 candidates (second is social to satisfy v3 §2)
+    c1 = SearchCandidate(
+        candidate_id="cand-0-nomatch",
+        candidate_url="http://campus.edu/student/other",
+        source_type=SourceType.WEB,
+        thumbnail_url="http://campus.edu/student/other.jpg",
+        is_social_domain=False,
+    )
+    c2 = SearchCandidate(
+        candidate_id="cand-1-match",
+        candidate_url="https://www.instagram.com/p/target123/",
+        source_type=SourceType.SOCIAL,
+        thumbnail_url="https://img.example.com/target.jpg",
+        is_social_domain=True,
+        found_via="serpapi_lens",
+    )
+    multi_search = SearchOutput(
+        candidates=[c1, c2],
+        status=CanonicalStatus.SEARCH_RESULTS_FOUND,
+    )
+
+    def multi_verify(inp):
+        if inp.candidate_id == "cand-0-nomatch":
+            return VerificationOutput(
+                candidate_id="cand-0-nomatch",
+                decision=VerificationDecision.NO_MATCH,
+                zone="LOW",
+                independent_similarity_score=0.12,
+                reason="Faces do not match (cosine 0.12)",
+            )
+        else:
+            return VerificationOutput(
+                candidate_id="cand-1-match",
+                decision=VerificationDecision.CANDIDATE_MATCH,
+                zone="HIGH",
+                independent_similarity_score=0.92,
+                reason="Match confirmed (cosine 0.92)",
+            )
+
+    patch_pipeline(
+        monkeypatch,
+        search=lambda *a, **kw: multi_search,
+        verify=multi_verify,
+        anchor=lambda r: fake_anchor(r, "0xdeadbeef"),
+    )
+    job_id = start_job(client)
+    job = wait_done(job_id)
+    assert job.status == CanonicalStatus.BLOCKCHAIN_CONFIRMED
+    assert job.verification.candidate_id == "cand-1-match"
+    assert job.verification.decision == VerificationDecision.CANDIDATE_MATCH
+
 
 

@@ -16,6 +16,9 @@ data/phase0_photos/
 install.log
 install.err
 .DS_Store
+node_modules/
+*.log
+_diag.py
 
 # Local test images / manually-uploaded assets
 test imgs/

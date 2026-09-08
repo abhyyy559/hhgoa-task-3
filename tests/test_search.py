@@ -37,9 +37,15 @@ FAKE_KEY = "fake-vision-key"
 
 @pytest.fixture(autouse=True)
 def offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No real keys, no real sleeps — fully offline + fast."""
+    """No real keys, no real sleeps — fully offline + fast.
+
+    Also pin the search provider to ``auto`` so these google_vision-path tests
+    are isolated from whatever ``SEARCH_PROVIDER`` the developer's real .env
+    carries (e.g. ``federated``), which the service loads with override=True.
+    """
     monkeypatch.setenv("GOOGLE_VISION_API_KEY", FAKE_KEY)
     monkeypatch.delenv("SERPAPI_KEY", raising=False)
+    monkeypatch.setenv("SEARCH_PROVIDER", "auto")
     monkeypatch.setattr(search_module.time, "sleep", lambda _s: None)
     clear_call_log()
 
@@ -106,27 +112,36 @@ def test_success_with_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["requests"][0]["image"]["content"]  # base64 image bytes present
 
     # Status semantics: candidates returned, verification NOT yet performed.
-    assert out.status == CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH
+    assert out.status == CanonicalStatus.SEARCH_RESULTS_FOUND
 
-    # Parsing: dedupe by URL, pages first, then partial, then visually similar.
+    # Resolver order: full image matches, partial, pages (metadata-only),
+    # visually similar. Dedupe by URL, first tier wins.
     urls = [c.candidate_url for c in out.candidates]
     assert urls == [
+        "https://img.example.com/full/1.jpg",
+        "https://img.example.com/partial/2.jpg",
         "https://www.facebook.com/photo?fbid=1",
         "https://example.org/missing-person-post",
-        "https://img.example.com/partial/2.jpg",
         "https://cdn.example.com/similar/3.jpg",
     ]
     assert len(urls) == len(set(urls))  # dedupe happened
 
+    tiers = [c.match_type for c in out.candidates]
+    assert tiers == ["full_match", "partial_match", "page", "page", "visually_similar"]
+
     first = out.candidates[0]
     assert first.candidate_id == hashlib.sha1(urls[0].encode()).hexdigest()[:12]
-    assert first.source_type.value == "social"  # facebook.com domain
-    assert first.thumbnail_url == "https://img.example.com/full/1.jpg"
-    assert out.candidates[1].source_type.value == "web"  # example.org
-    assert out.candidates[1].thumbnail_url == "https://img.example.com/full/1.jpg"  # page candidate
-    assert out.candidates[2].source_type.value == "web"
-    assert out.candidates[2].thumbnail_url is None  # partial match -> no thumbnail
-    assert out.candidates[3].thumbnail_url is None  # visually similar -> no thumbnail
+    assert first.thumbnail_url == urls[0]  # image match: URL is its own thumbnail
+    assert first.found_via == "google_vision"
+    fb = out.candidates[2]
+    assert fb.source_type.value == "social"  # facebook.com domain
+    assert fb.is_social_domain is True
+    assert fb.thumbnail_url is None  # pages carry no borrowed thumbnail (v3)
+    assert out.candidates[3].source_type.value == "web"  # example.org
+    assert out.candidates[3].is_social_domain is False
+    assert out.candidates[3].thumbnail_url is None
+    assert out.candidates[1].thumbnail_url == urls[1]  # partial image is own thumbnail
+    assert out.candidates[4].thumbnail_url == urls[4]  # similar image is own thumbnail
 
     # Schema-validates against the strict contract model.
     assert SearchOutput.model_validate(out.model_dump()) == out
@@ -194,8 +209,8 @@ def test_network_errors_retry_then_recover(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(search_module.time, "sleep", lambda _s: None)
 
     out = search(b"\x89PNG-fake-bytes")
-    assert out.status == CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH
-    assert len(out.candidates) == 4
+    assert out.status == CanonicalStatus.SEARCH_RESULTS_FOUND
+    assert len(out.candidates) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +276,7 @@ def test_fallback_unavailable_without_image_url(
         "post",
         lambda *a, **k: FakeResponse(503, {"error": {"status": "UNAVAILABLE"}}),
     )
-    out = search(b"\x89PNG-fake-bytes")  # bytes only -> SerpAPI cannot be used
+    out = search(b"\x89PNG-fake-bytes", engine="google_vision")  # bytes only -> SerpAPI cannot be used
 
     assert out.status == CanonicalStatus.SEARCH_API_FAILURE
     assert out.candidates == []
@@ -288,22 +303,140 @@ def test_fallback_used_when_image_url_provided(
             {
                 "image_results": [
                     {"original": "https://news.example.org/repost"},
-                    {"original": "https://vk.com/wall_1"},
+                    {"original": "https://www.instagram.com/p/abc123/"},
                 ]
             },
         ),
     )
-    out = search(b"\x89PNG-fake-bytes", image_url="https://host/query.jpg")
+    out = search(
+        b"\x89PNG-fake-bytes", image_url="https://host/query.jpg", engine="google_vision"
+    )
 
-    assert out.status == CanonicalStatus.SEARCH_SUCCESS_NO_HIGH_CONFIDENCE_MATCH
+    assert out.status == CanonicalStatus.SEARCH_RESULTS_FOUND
     assert [c.candidate_url for c in out.candidates] == [
         "https://news.example.org/repost",
-        "https://vk.com/wall_1",
+        "https://www.instagram.com/p/abc123/",
     ]
     assert out.candidates[1].source_type.value == "social"
+    assert out.candidates[1].is_social_domain is True
+    assert out.candidates[1].found_via == "serpapi_lens"
     assert "FALLBACK USED — live Vision API unreachable" in capsys.readouterr().out
     log = get_call_log()
     assert log[0]["fallback"] == {"used": True, "provider": "serpapi", "error": None}
+
+
+def test_rank_candidates_orders_cheap_first() -> None:
+    from contracts.schemas import SearchCandidate, SourceType
+    from services.search import rank_candidates
+
+    def _cand(cid: str, url: str, **kw: object) -> SearchCandidate:
+        base: dict[str, object] = {
+            "candidate_id": cid,
+            "candidate_url": url,
+            "source_type": SourceType.WEB,
+        }
+        base.update(kw)
+        return SearchCandidate(**base)  # type: ignore[arg-type]
+
+    smoke = _cand("d", "https://example.org/q")  # DDG smoke, no provenance
+    article = _cand("c", "https://news.example.org/a", match_type="page")
+    social_page = _cand(
+        "b", "https://www.instagram.com/p/x/", source_type=SourceType.SOCIAL,
+        is_social_domain=True, match_type="page", found_via="google_vision",
+    )
+    img = _cand(
+        "a", "https://img.example.com/f.jpg", match_type="full_match",
+        thumbnail_url="https://img.example.com/f.jpg", found_via="google_vision",
+    )
+    out = rank_candidates([smoke, article, social_page, img])
+    assert [c.candidate_id for c in out] == ["a", "b", "c", "d"]
+
+
+def _lineup_entry(cid: str, url: str, **kw: object) -> dict:
+    base: dict = {
+        "candidate_id": cid,
+        "candidate_url": url,
+        "source_type": "web",
+        "is_social_domain": False,
+        "found_via": "serpapi_lens",
+        "match_type": None,
+        "thumbnail_url": None,
+        "decision": "no_match",
+        "zone": "LOW",
+        "similarity": 0.0,
+        "faces_checked": 0,
+        "profile_username": None,
+        "handles": [],
+        "title": None,
+    }
+    base.update(kw)
+    return base
+
+
+def test_resolve_identity_picks_official_over_fan_page() -> None:
+    from services.search import resolve_identity
+
+    lineup = [
+        _lineup_entry(
+            "fan", "https://www.instagram.com/virat.fanclub/",
+            source_type="social", is_social_domain=True,
+            title="Virat Kohli Fan Club | Edits Daily",
+            decision="no_match", similarity=0.1, faces_checked=1,
+        ),
+        _lineup_entry(
+            "off", "https://www.instagram.com/virat.kohli/",
+            source_type="social", is_social_domain=True,
+            title="Virat Kohli • Instagram",
+            decision="candidate_match", similarity=0.91, faces_checked=1,
+        ),
+        _lineup_entry(
+            "post", "https://www.instagram.com/p/abc123/",
+            source_type="social", is_social_domain=True,
+            title="Virat Kohli • Instagram photo",
+            decision="candidate_match", similarity=0.88, faces_checked=1,
+        ),
+    ]
+    out = resolve_identity(
+        lineup, [{"description": "Virat Kohli", "score": 0.95}]
+    )
+    assert out["name"] == "Virat Kohli"
+    assert out["kind"] == "public_figure"
+    assert out["handle"] == "@virat.kohli"
+    assert out["profile_url"] == "https://www.instagram.com/virat.kohli/"
+    assert out["confidence"] == "high"
+    # Two independent face-verified hits behind the same entity.
+    assert out["officiality"] == "officially_linked"
+    assert not any("fanclub" in str(a.get("profile_url", "")) for a in out["alternates"])
+
+
+def test_resolve_identity_common_person_from_verified_hits() -> None:
+    from services.search import resolve_identity
+
+    lineup = [
+        _lineup_entry(
+            "c1", "https://www.instagram.com/p/xyz/",
+            source_type="social", is_social_domain=True,
+            title="Priya Sharma • Beach day",
+            profile_username="@priya.sharma",
+            decision="candidate_match", similarity=0.83, faces_checked=1,
+        ),
+    ]
+    out = resolve_identity(lineup, [])
+    assert out["kind"] == "low_presence"
+    assert out["profile_url"] == "https://www.instagram.com/p/xyz/"
+    assert out["handle"] == "@priya.sharma"
+    # Face-verified but never "official" without entity corroboration.
+    assert out["officiality"] == "unverified"
+
+
+def test_resolve_identity_empty_is_honest_low() -> None:
+    from services.search import resolve_identity
+
+    out = resolve_identity([], [])
+    assert out["kind"] == "low_presence"
+    assert out["confidence"] == "low"
+    assert out["officiality"] == "unknown"
+    assert out["handle"] is None
 
 
 def test_no_fallback_when_serpapi_key_unset(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,0 +1,26 @@
+{
+  "members": [
+    {
+      "member_id": "d507434c",
+      "full_name": "Aarav Sharma",
+      "role": "Lead Security Researcher",
+      "organization": "HH Goa Intelligence Lab",
+      "bio": "Specializes in biometric verification protocols and zero-knowledge cryptographic proofs.",
+      "image_filename": "d507434c.jpg",
+      "enrolled_at": "2026-09-06T12:45:38.018393+00:00",
+      "profile_url": "http://127.0.0.1:8000/api/gallery/profiles/d507434c",
+      "metadata": {}
+    },
+    {
+      "member_id": "e7080d06",
+      "full_name": "Priya Nair",
+      "role": "Distributed Systems Engineer",
+      "organization": "HH Goa Cyber Defense",
+      "bio": "Core developer of Polygon Amoy immutable state contracts and decentralized identity registries.",
+      "image_filename": "e7080d06.jpg",
+      "enrolled_at": "2026-09-06T12:45:38.034855+00:00",
+      "profile_url": "http://127.0.0.1:8000/api/gallery/profiles/e7080d06",
+      "metadata": {}
+    }
+  ]
+}

@@ -225,3 +225,157 @@ def test_similarity_helper():
     assert ver._cosine_similarity([0.0] * 512, [0.0] * 512) == 0.0
 
 
+def test_same_photo_detected_when_hashes_match(good_page, downloadable_images, monkeypatch):
+    """Same-photo repost is labeled, while the score stays face-only."""
+    query, cand = make_pair(0.90)
+    face = VisionOutput(
+        face_id="f1", embedding=cand, bbox=[0, 0, 9, 9], quality_score=0.9,
+        status=VisionStatus.OK,
+    )
+    monkeypatch.setattr(vision, "encode_all_faces", lambda img: [face])
+    monkeypatch.setattr(vision, "phash_bgr", lambda img: 12345)
+    vinput = make_vinput(query)
+    vinput_q = vinput.model_copy(update={"query_phash": 12345})
+    out = ver.verify(vinput_q)
+    assert out.decision.value == "candidate_match"
+    assert out.same_photo is True
+    assert "SAME photo" in out.reason
+
+
+def test_different_photo_face_match_labeled(good_page, downloadable_images, monkeypatch):
+    """Same face in a different photo is the face-level proof (not a repost)."""
+    query, cand = make_pair(0.90)
+    face = VisionOutput(
+        face_id="f1", embedding=cand, bbox=[0, 0, 9, 9], quality_score=0.9,
+        status=VisionStatus.OK,
+    )
+    monkeypatch.setattr(vision, "encode_all_faces", lambda img: [face])
+    monkeypatch.setattr(vision, "phash_bgr", lambda img: 99999)
+    vinput = make_vinput(query)
+    vinput_q = vinput.model_copy(update={"query_phash": 11111})
+    out = ver.verify(vinput_q)
+    assert out.decision.value == "candidate_match"
+    assert out.same_photo is False
+    assert "DIFFERENT photo" in out.reason
+
+
+def test_bounded_get_assembles_chunks_and_caps_size(monkeypatch):
+    import requests as _rq
+
+    class _StreamResp:
+        status_code = 200
+
+        def iter_content(self, chunk_size=1):
+            yield b"<html><head><title>T</title></head>"
+            yield b"<body>hi</body></html>"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ver.requests, "get", lambda *a, **k: _StreamResp())
+    code, text = ver._fetch_page("https://example.com/p")
+    assert code == 200
+    assert "<title>T</title>" in text
+
+    class _BigResp(_StreamResp):
+        def iter_content(self, chunk_size=1):
+            yield b"x" * (3 * 1024 * 1024)
+
+    monkeypatch.setattr(ver.requests, "get", lambda *a, **k: _BigResp())
+    with pytest.raises(ver.PageFetchError, match="cap"):
+        ver._fetch_page("https://example.com/big")
+
+    class _404Resp(_StreamResp):
+        status_code = 404
+
+    monkeypatch.setattr(ver.requests, "get", lambda *a, **k: _404Resp())
+    with pytest.raises(ver.PageFetchError, match="HTTP 404"):
+        ver._fetch_page("https://example.com/missing")
+    assert _rq  # keep import used
+
+
+def test_threshold_env_override_and_clamp(monkeypatch):
+    monkeypatch.setenv("VERIFICATION_ACCEPT_THRESHOLD", "0.60")
+    assert ver._threshold_from_env("VERIFICATION_ACCEPT_THRESHOLD", 0.48) == 0.60
+    monkeypatch.setenv("VERIFICATION_ACCEPT_THRESHOLD", "not-a-number")
+    assert ver._threshold_from_env("VERIFICATION_ACCEPT_THRESHOLD", 0.48) == 0.48
+    monkeypatch.setenv("VERIFICATION_ACCEPT_THRESHOLD", "9.0")
+    assert ver._threshold_from_env("VERIFICATION_ACCEPT_THRESHOLD", 0.48) == 1.0
+    monkeypatch.delenv("VERIFICATION_ACCEPT_THRESHOLD", raising=False)
+    assert ver._threshold_from_env("VERIFICATION_ACCEPT_THRESHOLD", 0.48) == 0.48
+
+
+def test_phash_helpers_are_sane():
+    img_a = np.random.RandomState(0).randint(0, 255, size=(64, 64, 3)).astype(np.uint8)
+    img_b = img_a.copy()
+    img_c = np.random.RandomState(1).randint(0, 255, size=(64, 64, 3)).astype(np.uint8)
+    ha, hb, hc = (vision.phash_bgr(i) for i in (img_a, img_b, img_c))
+    assert vision.phash_distance(ha, hb) == 0
+    assert vision.phash_distance(ha, hc) > vision.SAME_PHOTO_HAMMING_THRESHOLD
+    assert isinstance(ha, int)
+
+
+# ---------------------------------------------------------------------------
+# Identity extraction — the matched person's details are scraped from the page
+# (name, bio, social handles) with no username fed in by the operator.
+# ---------------------------------------------------------------------------
+IDENTITY_HTML = (
+    "<html><head>"
+    "<title>Aarav Sharma — HH Goa Directory</title>"
+    '<meta name="description" content="Lead Security Researcher">'
+    '<meta property="og:description" content="Biometric verification & ZK proofs">'
+    '<meta property="og:image" content="https://img.example.com/og.jpg">'
+    "</head><body>"
+    '<img src="https://img.example.com/first.jpg">'
+    "<p>Reach me @aarav_s or @hhgoa_lab</p>"
+    "</body></html>"
+)
+
+
+def test_extract_metadata_scrapes_identity_fields():
+    meta = ver._extract_metadata(IDENTITY_HTML)
+    assert meta["title"] == "Aarav Sharma — HH Goa Directory"
+    assert meta["description"] == "Lead Security Researcher"
+    assert meta["og_description"] == "Biometric verification & ZK proofs"
+    assert set(meta["potential_handles"]) == {"aarav_s", "hhgoa_lab"}
+
+
+def test_extract_metadata_empty_on_bare_page():
+    assert ver._extract_metadata("<html><body>nothing</body></html>") == {}
+
+
+def test_extract_metadata_filters_css_js_junk_handles():
+    html = (
+        "<html><head><style>@media screen { @font-face { font-family: x; } "
+        "@keyframes spin {} }</style>"
+        '<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Person"}</script>'
+        "</head><body><p>Reach me @real_person</p></body></html>"
+    )
+    meta = ver._extract_metadata(html)
+    assert meta["potential_handles"] == ["real_person"]
+
+
+def test_match_surfaces_extracted_metadata(downloadable_images, monkeypatch):
+    """A verified match carries the scraped identity details end-to-end."""
+    monkeypatch.setattr(ver, "_fetch_page", lambda url: (200, IDENTITY_HTML))
+    query, cand = make_pair(0.90)
+    monkeypatch.setattr(vision, "detect_and_encode", fake_detect(embedding=cand))
+    out = ver.verify(make_vinput(query))
+    assert out.decision.value == "candidate_match"
+    assert out.extracted_metadata is not None
+    assert out.extracted_metadata["title"] == "Aarav Sharma — HH Goa Directory"
+    assert "aarav_s" in out.extracted_metadata["potential_handles"]
+
+
+def test_no_match_page_has_no_metadata(monkeypatch):
+    """Unreachable candidate pages surface no fabricated identity."""
+    def _raise(url):
+        raise ver.PageFetchError("boom")
+
+    monkeypatch.setattr(ver, "_fetch_page", _raise)
+    query, _cand = make_pair(0.9)
+    out = ver.verify(make_vinput(query))
+    assert out.decision.value == "no_match"
+    assert out.extracted_metadata is None
+
+

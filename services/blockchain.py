@@ -49,8 +49,11 @@ import requests
 from dotenv import load_dotenv
 
 from contracts.schemas import CanonicalRecord, OnChainRecord, VerificationOutput
+from services.log import log as _log
 
-load_dotenv()
+# override=True: the project's .env is the single source of truth for
+# credentials. A stale same-named OS environment variable must never shadow it.
+load_dotenv(override=True)
 
 PIPELINE_VERSION = "1.0.0"
 
@@ -62,7 +65,7 @@ PINATA_PIN_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
 PINATA_TIMEOUT_S = 30
 
 TX_WAIT_TIMEOUT_S = 180  # seconds to wait for a receipt before giving up
-DEPLOY_GAS = 1_800_000
+DEPLOY_GAS = 600_000
 ANCHOR_GAS = 400_000
 
 #: Transient tx-submit retries (fresh nonce each attempt) before surfacing
@@ -90,8 +93,12 @@ class BlockchainWriteError(RuntimeError):
 # Canonical record (§4) — pure functions, no network
 # ---------------------------------------------------------------------------
 def canonical_json(record: dict[str, Any]) -> str:
-    """Canonical JSON: sorted keys, no whitespace — hash-stable."""
-    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Canonical JSON per CONTRACTS.md §4 v3: sorted keys, fixed separators.
+
+    Exact spec: json.dumps(record, sort_keys=True, separators=(',', ':'))
+    Anyone re-verifying independently must use this exact serialization.
+    """
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
 
 
 def rebuild_content_hash(record_dict: dict[str, Any]) -> str:
@@ -106,18 +113,33 @@ def build_canonical_record(
     *,
     source_url: str,
     pipeline_version: str = PIPELINE_VERSION,
+    query_embedding: Optional[list[float]] = None,
 ) -> CanonicalRecord:
     """Build the §4 record from a verification outcome.
 
     Only ``sha256(candidate_url)`` enters the record — never the raw URL, and
     nothing biometric. The record model itself (``extra="forbid"``) forbids
     any embedding or raw image data from sneaking in.
+
+    ``query_embedding_hash`` is the sha256 of the embedding rounded to 4
+    decimal places (for reproducibility across hardware runs). Always present
+    as a key (None when no embedding supplied) so rebuild_content_hash is
+    reproducible from model_dump — otherwise dump includes the None key and
+    the hash mismatches.
     """
+    if query_embedding is not None:
+        rounded = [round(float(v), 4) for v in query_embedding]
+        qeh = hashlib.sha256(
+            json.dumps(rounded, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    else:
+        qeh = None
     record: dict[str, Any] = {
         "record_version": "1.0",
         "record_id": str(uuid.uuid4()),
         "content_cid": None,
         "source_reference_hash": hashlib.sha256(source_url.encode("utf-8")).hexdigest(),
+        "query_embedding_hash": qeh,
         "verification_result": verification.decision.value,
         "verification_timestamp": datetime.now(timezone.utc).isoformat(),
         "pipeline_version": pipeline_version,
@@ -170,10 +192,7 @@ def pin_to_ipfs(record: CanonicalRecord) -> Optional[str]:
     """
     jwt = os.getenv("PINATA_JWT")
     if not jwt:
-        print(
-            "[BlockchainService] IPFS pin skipped — PINATA_JWT not set "
-            "(content_cid will be null; see HUMAN_ACTIONS.md H2)"
-        )
+        _log("chain", "IPFS pin skipped, no PINATA_JWT (content_cid null)")
         return None
     try:
         resp = requests.post(
@@ -183,19 +202,16 @@ def pin_to_ipfs(record: CanonicalRecord) -> Optional[str]:
             timeout=PINATA_TIMEOUT_S,
         )
     except requests.RequestException as exc:
-        print(f"[BlockchainService] IPFS pin FAILED (network): {exc}")
+        _log("chain", f"IPFS pin failed, network: {type(exc).__name__}")
         return None
     if resp.status_code != 200:
-        print(
-            f"[BlockchainService] IPFS pin FAILED: HTTP {resp.status_code} "
-            f"{resp.text[:200]}"
-        )
+        _log("chain", f"IPFS pin failed, HTTP {resp.status_code}")
         return None
     cid = resp.json().get("IpfsHash")
     if not cid:
-        print("[BlockchainService] IPFS pin FAILED: no IpfsHash in response")
+        _log("chain", "IPFS pin failed, no IpfsHash in response")
         return None
-    print(f"[BlockchainService] IPFS pinned: {cid}")
+    _log("chain", f"IPFS pinned {cid}")
     return str(cid)
 
 
@@ -342,11 +358,7 @@ def anchor_record(record: CanonicalRecord) -> OnChainRecord:
                 raise  # chainId mismatch etc. is not transient; don't retry
             except Exception as exc:  # noqa: BLE001 — transient network/RPC error
                 last_error = exc
-                print(
-                    f"[BlockchainService] anchor tx attempt "
-                    f"{attempt + 1}/{MAX_TX_ATTEMPTS} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                _log("chain", f"anchor attempt {attempt + 1}/{MAX_TX_ATTEMPTS} failed: {type(exc).__name__}")
                 if attempt < MAX_TX_ATTEMPTS - 1:
                     time.sleep(RETRY_DELAYS_S[attempt])
 
@@ -440,7 +452,7 @@ def deploy_anchor_contract() -> str:
     except Exception as exc:  # noqa: BLE001 — every other failure is a write failure
         raise BlockchainWriteError(f"{type(exc).__name__}: {exc}") from exc
     address = w3.to_checksum_address(receipt.contractAddress)
-    print(f"[BlockchainService] deployed AnchorRecord at {address}")
+    _log("chain", f"AnchorRecord deployed at {address}")
     return address
 
 

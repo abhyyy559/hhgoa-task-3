@@ -133,7 +133,48 @@ def load_face_app() -> Any:
     separate detect, separate encode, separate score), not a separate model.
     Stated precisely per TASK3_ARCHITECTURE.md §10 rather than overclaimed.
     """
-    return _model
+    return _get_model()
+
+
+def encode_all_faces(image_bgr: np.ndarray) -> list[VisionOutput]:
+    """Detect ALL faces and return one VisionOutput per usable face (v3).
+
+    Used by VerificationService for multi-face max-score: compare the query
+    embedding against every detected face and take the maximum — do not
+    assume the target is the largest/most-centered face.
+
+    Filters by MIN_DET_SCORE and embedding presence; returns [] when no
+    usable face. Raises VisionModelNotReadyError when pack missing,
+    ValueError on bad image shape.
+    """
+    arr = np.asarray(image_bgr)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(
+            f"image_bgr must be an HxWx3 BGR ndarray, got shape {arr.shape}"
+        )
+    app = _get_model()
+    faces: List[FaceLike] = list(app.get(arr))
+    outputs: list[VisionOutput] = []
+    for face in faces:
+        det_score = _as_float(face.det_score)
+        if det_score < MIN_DET_SCORE:
+            continue
+        raw = getattr(face, "normed_embedding", None)
+        if raw is None:
+            continue
+        emb = [float(v) for v in np.asarray(raw).reshape(-1)]
+        if len(emb) != 512:
+            continue
+        outputs.append(
+            VisionOutput(
+                face_id=str(uuid.uuid4()),
+                embedding=emb,
+                bbox=_bbox_list(face.bbox),
+                quality_score=det_score,
+                status=VisionStatus.OK,
+            )
+        )
+    return outputs
 
 
 def _as_float(value: Any) -> float:
@@ -144,6 +185,37 @@ def _as_float(value: Any) -> float:
 def _bbox_list(bbox: Any) -> List[int]:
     """Round a [x1, y1, x2, y2] bbox to the contract's list[int]."""
     return [int(round(float(v))) for v in np.asarray(bbox).reshape(-1)[:4]]
+
+
+def phash_bgr(image_bgr: np.ndarray) -> int:
+    """64-bit dHash perceptual hash of a BGR image (photo-level identity).
+
+    Used to tell "same photo reposted" apart from "same face, different
+    photo": two crops/scales of one picture hash within a few bits, while
+    different photos of one person differ widely — even though both can
+    score HIGH on face similarity. Grayscale 9x8 + adjacent-column
+    differences; pure OpenCV/numpy, no new dependencies.
+    """
+    import cv2 as _cv2
+
+    gray = _cv2.cvtColor(np.asarray(image_bgr), _cv2.COLOR_BGR2GRAY)
+    small = _cv2.resize(gray, (9, 8), interpolation=_cv2.INTER_LINEAR)
+    diff = (small[:, 1:] > small[:, :-1]).astype(np.uint8)
+    bits = diff.reshape(-1)
+    value = 0
+    for b in bits:
+        value = (value << 1) | int(b)
+    return value
+
+
+def phash_distance(a: int, b: int) -> int:
+    """Hamming distance between two dHash values (0 = identical)."""
+    return bin(int(a) ^ int(b)).count("1")
+
+
+#: Max Hamming distance calling two images the same photo (allows for
+#: re-compression, rescaling, slight crops — all common in reposts).
+SAME_PHOTO_HAMMING_THRESHOLD: int = 8
 
 
 def select_primary_face(faces: List[FaceLike]) -> FaceLike:

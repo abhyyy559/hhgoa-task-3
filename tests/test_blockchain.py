@@ -43,9 +43,10 @@ def test_record_has_no_biometric_or_raw_url_data():
     record = blockchain_record()
     dumped = record.model_dump()
     # Minimized record only: no embeddings, no raw URLs, no image bytes.
+    # query_embedding_hash is a one-way hash, not biometric — allowed per §4 v3.
     assert set(dumped) == {
         "record_version", "record_id", "content_hash", "content_cid",
-        "source_reference_hash", "verification_result",
+        "source_reference_hash", "query_embedding_hash", "verification_result",
         "verification_timestamp", "pipeline_version",
     }
     assert "https://page.example.com/post" not in canonical_str(dumped)

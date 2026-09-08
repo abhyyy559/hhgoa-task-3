@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
 def set_env(key: str, value: str) -> None:
